@@ -1,0 +1,837 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Guardian — Security Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #1e1e2e; --surface: #252535; --surface2: #2d2d45;
+    --border: #3a3a5c; --text: #e0e0f0; --dim: #888aaa;
+    --green: #00ff87; --red: #ff4757; --yellow: #ffd166;
+    --purple: #7289da; --spotify: #1db954;
+  }
+  html, body { height: 100%; font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); }
+
+  .layout { display: flex; height: 100vh; overflow: hidden; }
+
+  /* Sidebar */
+  .sidebar {
+    width: 220px; min-width: 220px; background: #16162a;
+    display: flex; flex-direction: column;
+    border-right: 1px solid var(--border);
+  }
+  .sidebar-logo { display: flex; align-items: center; gap: 10px; padding: 20px; border-bottom: 1px solid var(--border); text-decoration: none; color: inherit; transition: opacity 0.2s; }
+  .sidebar-logo:hover { opacity: 0.8; }
+  .logo-icon { width: 36px; height: 36px; background: var(--green); border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0; color: #1e1e2e; }
+  .logo-text { font-size: 18px; font-weight: 700; }
+  .nav { flex: 1; padding: 12px 10px; display: flex; flex-direction: column; gap: 4px; }
+  .nav-item { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 8px; cursor: pointer; color: var(--dim); font-size: 14px; font-weight: 500; transition: all 0.15s; user-select: none; }
+  .nav-item:hover { background: var(--surface); color: var(--text); }
+  .nav-item.active { background: var(--surface2); color: var(--green); }
+  .nav-icon { font-size: 15px; width: 20px; text-align: center; }
+  .sidebar-footer { padding: 14px; border-top: 1px solid var(--border); }
+  .user-pill { display: flex; align-items: center; gap: 10px; padding: 8px 10px; background: var(--surface); border-radius: 8px; min-width: 0; }
+  .user-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--spotify); flex-shrink: 0; }
+  .user-info { min-width: 0; }
+  .user-name { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .user-role { font-size: 10px; color: var(--dim); }
+  .logout-btn { margin-top: 8px; width: 100%; padding: 7px; border-radius: 6px; background: transparent; border: 1px solid var(--border); color: var(--dim); cursor: pointer; font-size: 12px; transition: all 0.15s; font-family: inherit; }
+  .logout-btn:hover { background: var(--red); color: #fff; border-color: var(--red); }
+
+  /* Main */
+  .main { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
+  .topbar { padding: 14px 24px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+  .topbar-title { font-size: 16px; font-weight: 600; }
+  .health-pill { display: flex; align-items: center; gap: 8px; background: var(--surface); padding: 6px 14px; border-radius: 20px; font-size: 13px; font-weight: 600; white-space: nowrap; }
+  .health-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--spotify); transition: background 0.5s; }
+
+  /* Content sections */
+  .section { flex: 1; overflow-y: auto; padding: 20px 24px; display: none; flex-direction: column; gap: 16px; }
+  .section.active { display: flex; }
+
+  /* Stat cards */
+  .stat-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; flex-shrink: 0; }
+  .stat-card { background: var(--surface); border-radius: 12px; padding: 16px 18px; border: 1px solid var(--border); display: flex; align-items: center; gap: 14px; transition: transform 0.15s; }
+  .stat-card:hover { transform: translateY(-2px); }
+  .stat-ico { font-size: 22px; width: 42px; height: 42px; border-radius: 10px; background: var(--surface2); display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .stat-val { font-size: 24px; font-weight: 700; line-height: 1; }
+  .stat-label { font-size: 11px; color: var(--dim); margin-top: 4px; }
+  .green { color: var(--green); } .red { color: var(--red); } .yellow { color: var(--yellow); }
+
+  /* Charts */
+  .charts-row { display: grid; grid-template-columns: 2fr 1fr; gap: 14px; flex-shrink: 0; }
+  .card { background: var(--surface); border-radius: 12px; padding: 16px 18px; border: 1px solid var(--border); }
+  .card-title { font-size: 11px; font-weight: 600; color: var(--dim); margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .chart-wrap { position: relative; height: 140px; }
+
+  /* Process table */
+  .bottom-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; min-height: 250px; }
+  .table-wrap { max-height: 260px; overflow-y: auto; padding-right: 8px; }
+  .proc-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .proc-table th { text-align: left; padding: 10px 12px; color: var(--dim); font-weight: 500; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--surface); z-index: 10; }
+  .proc-table td { padding: 12px 12px; border-bottom: 1px solid rgba(255,255,255,0.04); }
+  .proc-table tr:last-child td { border-bottom: none;    }
+    .clickable-row {
+      cursor: pointer;
+      transition: background 0.15s ease;
+    }
+    .clickable-row:hover {
+      background: rgba(255, 255, 255, 0.05);
+    }
+    .badge { display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px; border-radius: 10px; font-size: 10px; font-weight: 700; white-space: nowrap; }
+  .badge-safe { background: rgba(0,255,135,0.12); color: var(--green); }
+  .badge-anomaly { background: rgba(255,71,87,0.12); color: var(--red); }
+  .badge-pending { background: rgba(255,209,102,0.12); color: var(--yellow); }
+  .wl-btn { background: none; border: none; cursor: pointer; opacity: 0.5; transition: opacity 0.2s; padding: 2px; }
+  .wl-btn:hover { opacity: 1; transform: scale(1.1); }
+
+  /* Insight */
+  .insight-text { font-size: 13px; line-height: 1.7; color: var(--dim); }
+  .insight-text strong { color: var(--text); }
+
+  /* OTP */
+  .otp-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; max-height: 140px; overflow-y: auto; }
+  .otp-item { background: var(--surface2); border-radius: 8px; padding: 8px 12px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .otp-info { font-size: 12px; color: var(--dim); }
+  .otp-info strong { color: var(--text); }
+  .approve-btn { background: var(--green); color: #1e1e2e; border: none; border-radius: 6px; padding: 4px 10px; font-size: 11px; font-weight: 700; cursor: pointer; font-family: inherit; }
+
+  /* Session history */
+  .session-row { padding: 12px 0; border-bottom: 1px solid rgba(255,255,255,0.06); }
+  .session-row:last-child { border-bottom: none; }
+
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+  #toast { position: fixed; bottom: 24px; right: 24px; background: var(--surface2); border: 1px solid var(--border); border-radius: 10px; padding: 12px 18px; font-size: 13px; transform: translateY(80px); opacity: 0; transition: all 0.3s; z-index: 999; }
+  #toast.show { transform: translateY(0); opacity: 1; }
+</style>
+</head>
+<body>
+<div class="layout">
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <a href="/home" class="sidebar-logo">
+      <div class="logo-icon">🛡</div>
+      <span class="logo-text">Guardian</span>
+    </a>
+    <nav class="nav">
+      <div class="nav-item active" id="nav-dashboard" onclick="showSection('dashboard', this)">
+        <span class="nav-icon">📊</span> Dashboard
+      </div>
+      <div class="nav-item" id="nav-sessions" onclick="showSection('sessions', this)">
+        <span class="nav-icon">🗂</span> Sessions
+      </div>
+      <div class="nav-item" id="nav-admin" style="display:none" onclick="showSection('admin', this)">
+        <span class="nav-icon">🔑</span> Admin
+      </div>
+    </nav>
+    <div class="sidebar-footer">
+      <div class="user-pill">
+        <div class="user-dot"></div>
+        <div class="user-info">
+          <div class="user-name" id="sbUsername">Guest</div>
+          <div class="user-role" id="sbRole">Read-Only</div>
+        </div>
+      </div>
+      <div id="authActions">
+        <button class="logout-btn" onclick="window.location='/login'">Sign In</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Main -->
+  <main class="main">
+    <div class="topbar">
+      <span class="topbar-title" id="sectionTitle">Live Dashboard</span>
+      <div class="health-pill">
+        <div class="health-dot" id="healthDot"></div>
+        <span id="healthPct">100%</span>&nbsp;System Health
+      </div>
+    </div>
+
+    <!-- Dashboard Section -->
+    <div class="section active" id="section-dashboard">
+      <div class="stat-row">
+        <div class="stat-card">
+          <div class="stat-ico">⚡</div>
+          <div><div class="stat-val green" id="statRows">0</div><div class="stat-label">Events Processed</div></div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-ico">⚠️</div>
+          <div><div class="stat-val red" id="statAlerts">0</div><div class="stat-label">Alerts This Session</div></div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-ico">🧠</div>
+          <div><div class="stat-val yellow" id="statKB">0</div><div class="stat-label">KB Signature Matches</div></div>
+        </div>
+      </div>
+
+      <div class="charts-row">
+        <div class="card">
+          <div class="card-title">GPU Anomaly Score — Live</div>
+          <div class="chart-wrap"><canvas id="scoreChart"></canvas></div>
+        </div>
+        <div class="card">
+          <div class="card-title">Activity Breakdown</div>
+          <div class="chart-wrap"><canvas id="activityChart"></canvas></div>
+        </div>
+      </div>
+
+      <div class="bottom-row">
+        <div class="card">
+          <div class="card-title">Active Processes</div>
+          <div class="table-wrap">
+            <table class="proc-table">
+              <thead><tr><th>PID</th><th>Process</th><th>Class</th><th>GPU ms</th><th>Status</th><th>Actions</th></tr></thead>
+              <tbody id="procTableBody">
+                <tr><td colspan="5" style="color:var(--dim);text-align:center;padding:20px">Waiting for events...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">Session Insight</div>
+          <p class="insight-text" id="insightText">Session starting. AI models are warming up...</p>
+          <div id="adminOTPSection" style="display:none; margin-top:14px">
+            <div class="card-title">Pending Whitelist Requests</div>
+            <div class="otp-list" id="otpList"><div style="color:var(--dim);font-size:12px;text-align:center;padding:16px">No pending requests.</div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Sessions Section -->
+    <div class="section" id="section-sessions">
+      <div class="card">
+        <div class="card-title">Session History</div>
+        <div class="table-wrap">
+          <table class="proc-table">
+            <thead><tr><th>Machine ID</th><th>Date</th><th>Events</th><th>Alerts</th><th>Health</th></tr></thead>
+            <tbody id="sessionHistory"><tr><td colspan="5" style="text-align:center">Loading...</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Admin Panel Section -->
+    <div class="section" id="section-admin">
+      <div class="bottom-row" style="margin-bottom:20px;">
+        <div class="card">
+          <div class="card-title">Pending Whitelist Requests</div>
+          <div class="otp-list" id="adminPendingRequests"><div style="color:var(--dim);font-size:12px;text-align:center;padding:16px">No pending requests.</div></div>
+        </div>
+        <div class="card">
+          <div class="card-title">Ignored Processes</div>
+          <div class="otp-list" id="adminIgnoredList"><div style="color:var(--dim);font-size:12px;text-align:center;padding:16px">No ignored processes.</div></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">Permanent Whitelist</div>
+        <div class="table-wrap">
+          <table class="proc-table">
+            <thead><tr><th>Process</th><th>Status</th><th>Approved By</th><th>Date</th><th>Action</th></tr></thead>
+            <tbody id="adminWhitelistTable"><tr><td colspan="5" style="text-align:center">Loading...</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">Registered Users</div>
+        <div class="table-wrap">
+          <table class="proc-table">
+            <thead><tr><th>ID</th><th>Username</th><th>Role</th><th>Registered</th><th>Action</th></tr></thead>
+            <tbody id="adminUsersList"><tr><td colspan="5" style="text-align:center">Loading...</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div id="toast"></div>
+
+<script>
+// ── State ──
+let currentUser = {role:'guest', username:'Guest'};
+let procs = {};
+let activityCounts = {};
+let sessionRows = 0, sessionAlerts = 0, sessionKB = 0;
+let scoreData = [], scoreLabels = [];
+let wsRetries = 0;
+let deadPids = new Set();
+
+// ── Render throttle — batches DOM updates to max 60fps via rAF ──
+let _renderScheduled = false;
+let _chartDirty = false;
+let _lastIsAnomaly = false;
+// Security: HTML escape to prevent XSS via process names in innerHTML
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = String(s ?? '');
+  return d.innerHTML;
+}
+
+function scheduleRender() {
+  if (_renderScheduled) return;
+  _renderScheduled = true;
+  requestAnimationFrame(() => {
+    if (_chartDirty) {
+      scoreChart.data.datasets[0].borderColor = _lastIsAnomaly ? '#ff4757' : '#00ff87';
+      scoreChart.update('none');
+      activityChart.update('none');
+      _chartDirty = false;
+    }
+    renderProcTable();
+    updateInsight();
+    _renderScheduled = false;
+  });
+}
+
+const scoreChart = new Chart(
+  document.getElementById('scoreChart').getContext('2d'), {
+  type:'line',
+  data:{ labels: scoreLabels, datasets:[{
+    label:'Severity', data: scoreData,
+    borderColor:'#00ff87', borderWidth:2, pointRadius:0, tension:0.4,
+    fill:true, backgroundColor:'rgba(0,255,135,0.06)'
+  }]},
+  options:{
+    animation:false, responsive:true, maintainAspectRatio:false,
+    scales:{
+      x:{display:false},
+      y:{min:-1.0, max:1.0, grid:{color:'rgba(255,255,255,0.04)'},
+         ticks:{stepSize:0.1, color:'#888aaa',font:{size:10}}}
+    },
+    plugins:{legend:{display:false}}
+  }
+});
+
+const ACTIVITY_COLORS = {'Gaming':'#1db954','3D/UI Activity':'#7289da','Compute':'#ffd166','Idle':'#444466','SUSPICIOUS_COPY':'#ff4757','Unknown':'#3a3a5c'};
+const activityChart = new Chart(
+  document.getElementById('activityChart').getContext('2d'), {
+  type:'doughnut',
+  data:{labels:['Waiting'],datasets:[{data:[1],backgroundColor:['#2d2d45'],borderWidth:0}]},
+  options:{responsive:true,maintainAspectRatio:false,cutout:'70%',
+    plugins:{legend:{position:'bottom',labels:{color:'#888aaa',boxWidth:10,font:{size:11}}}}}
+});
+
+// ── Auth ──
+async function checkAuth(){
+  try {
+    const r = await fetch('/auth/me');
+    const u = await r.json();
+    currentUser = u;
+    document.getElementById('sbUsername').textContent = u.username || 'Guest';
+    document.getElementById('sbRole').textContent =
+      u.role === 'admin' ? '🔑 Admin' : u.role === 'user' ? 'User' : 'Guest';
+    if(u.role !== 'guest'){
+      document.getElementById('authActions').innerHTML =
+        '<button class="logout-btn" onclick="logout()">Sign Out</button>';
+    }
+    if(u.role === 'admin'){
+      document.getElementById('nav-admin').style.display = 'flex';
+      document.getElementById('adminOTPSection').style.display = 'block';
+      loadPendingOTPs();
+    }
+  } catch(e) {}
+}
+
+async function logout(){
+  await fetch('/auth/logout', {method:'POST'});
+  window.location.reload();
+}
+
+// ── Navigation ──
+function showSection(name, el){
+  document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  const sec = document.getElementById('section-' + name);
+  if(sec) sec.classList.add('active');
+  if(el) el.classList.add('active');
+  const titles = {dashboard:'Live Dashboard', sessions:'Session History', admin:'Admin Panel'};
+  document.getElementById('sectionTitle').textContent = titles[name] || '';
+  if(name === 'sessions') loadSessions();
+  if(name === 'admin' && currentUser.role === 'admin') loadAdminData();
+}
+
+// ── WebSocket ──
+function connectWS(){
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/ws/stream`);
+  ws.onopen = () => { wsRetries = 0; };
+  ws.onmessage = (e) => {
+    try {
+      // Server now sends a JSON array of events per frame
+      const parsed = JSON.parse(e.data);
+      const events = Array.isArray(parsed) ? parsed : [parsed];
+      for (const ev of events) {
+        if (ev.type === 'ping') continue;
+        handleEvent(ev);
+      }
+    } catch(_) {}
+  };
+  ws.onclose = () => {
+    const delay = Math.min(1000 * Math.pow(1.5, wsRetries), 10000);
+    wsRetries++;
+    setTimeout(connectWS, delay);
+  };
+}
+
+function handleEvent(ev){
+  // Handle Admin Notifications instantly from WebSockets
+  if (ev.type === 'whitelist_requested' && currentUser.role === 'admin') {
+    showToast(`🔔 Whitelist Request: ${ev.name} (PID: ${ev.pid})`);
+    loadPendingOTPs();
+    return;
+  }
+
+  if(ev.type !== 'verdict') return;
+  
+  // ── Prune ghost packets for recently killed/suspended processes ──
+  const pid = String(ev.pid || 'unknown');
+  if (deadPids.has(pid)) return;
+
+  sessionRows++;
+  document.getElementById('statRows').textContent = sessionRows.toLocaleString();
+
+  if(ev.score === -1){
+    sessionAlerts++;
+    document.getElementById('statAlerts').textContent = sessionAlerts;
+  }
+  if(ev.kb_match){
+    sessionKB++;
+    document.getElementById('statKB').textContent = sessionKB;
+  }
+
+  // Health
+  const health = Math.max(0, 100 - (sessionAlerts / Math.max(sessionRows, 1)) * 100);
+  document.getElementById('healthPct').textContent = Math.round(health) + '%';
+  const dot = document.getElementById('healthDot');
+  dot.style.background = health > 80 ? '#1db954' : health > 55 ? '#ffd166' : '#ff4757';
+
+  // Score chart (-1.0 to 1.0)
+  const t = new Date(ev.ts * 1000).toLocaleTimeString();
+  scoreLabels.push(t);
+  let severityVal = typeof ev.severity === 'number' ? ev.severity : 0;
+  if (severityVal > 1.0) severityVal = 1.0;
+  
+  let plotVal = 0;
+  if(ev.score === -1) {
+    plotVal = -Math.max(severityVal, 0.2); // Anomaly plotting
+  } else {
+    plotVal = Math.max(1.0 - severityVal, 0.1); // Safe plotting
+  }
+  scoreData.push(plotVal);
+  if(scoreLabels.length > 80){ scoreLabels.shift(); scoreData.shift(); }
+  // Mark chart dirty — actual redraw batched in scheduleRender()
+  _lastIsAnomaly = ev.score === -1;
+
+  // Activity donut — update data only, defer render
+  const cat = ev.category || 'Unknown';
+  activityCounts[cat] = (activityCounts[cat] || 0) + 1;
+  const labels = Object.keys(activityCounts);
+  activityChart.data.labels = labels.map(l => `${l} (${activityCounts[l]})`);
+  activityChart.data.datasets[0].data = labels.map(l => activityCounts[l]);
+  activityChart.data.datasets[0].backgroundColor = labels.map(l => ACTIVITY_COLORS[l] || '#3a3a5c');
+  _chartDirty = true;
+
+  // Process table — update state only, defer DOM repaint
+  if(!procs[pid]) procs[pid] = {name: ev.name || pid, category: cat, gpu: 0, count: 0, alerts: 0, first_seen: Date.now(), last_seen: Date.now()};
+  procs[pid].gpu = ev.gpu_ms || 0;
+  procs[pid].count++;
+  procs[pid].category = cat;
+  procs[pid].last_seen = Date.now();
+  if(ev.score === -1) procs[pid].alerts++;
+
+  // Defer all DOM repaints to next animation frame — max 60fps regardless of event rate
+  scheduleRender();
+}
+
+function renderProcTable(){
+  // Stable sort: oldest processes first, so the list doesn't jump around on every tick
+  const rows = Object.entries(procs)
+    .sort((a,b) => a[1].first_seen - b[1].first_seen)
+    .slice(0, 50); // allow scrolling through up to 50 active processes
+  
+  document.getElementById('procTableBody').innerHTML = rows.map(([pid, p]) => {
+    const ratio = p.count ? p.alerts / p.count : 0;
+    let badge, status;
+    if(ratio > 0.3){ badge='badge-anomaly'; status='ANOMALY'; }
+    else if(p.alerts === 0){ badge='badge-safe'; status='SAFE'; }
+    else { badge='badge-pending'; status='MIXED'; }
+    
+    const name = (p.name || '').split('\\').pop().slice(0, 22);
+    
+    let wlBtn = '';
+    let actBtns = '';
+    if (currentUser.role === 'admin') {
+      // Whitelist button and Action buttons are always visible for admins
+      wlBtn = `<button class="wl-btn" title="Direct Whitelist" onclick="directWhitelist('${p.name}', '${p.category}')">🛡</button>`;
+      actBtns = `
+        <button class="wl-btn" style="color:var(--red)" title="Kill" onclick="adminAction('kill', '${pid}', '${p.name}')">🗡</button>
+        <button class="wl-btn" style="color:var(--yellow)" title="Suspend" onclick="adminAction('suspend', '${pid}', '${p.name}')">⏸</button>
+        <button class="wl-btn" style="color:var(--dim)" title="Leave" onclick="adminAction('leave', '${pid}', '${p.name}')">→</button>
+      `;
+    } else if (currentUser.role !== 'admin') {
+      // Users and Guests only get the Request Whitelist lifeline
+      actBtns = `<button class="wl-btn" style="color:var(--purple);font-size:11px;" title="Request Whitelist" onclick="requestWhitelist('${pid}', '${p.name}')">🛡 Request WL</button>`;
+    }
+    
+    return `<tr>
+      <td style="color:var(--dim);font-family:monospace;font-size:11px">${pid.slice(-5)}</td>
+      <td style="max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${p.name}">${name}</td>
+      <td style="color:var(--dim);font-size:11px">${(p.category||'').replace('Activity','').trim()}</td>
+      <td style="font-family:monospace;font-size:11px">${(p.gpu||0).toFixed(2)}</td>
+      <td><span class="badge ${badge}">${status} ${wlBtn}</span></td>
+      <td style="white-space:nowrap">${actBtns}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function directWhitelist(processName, category) {
+  if(!confirm(`Whitelist ${processName} globally?`)) return;
+  const r = await fetch('/whitelist/direct', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({process_name: processName, category: category})
+  });
+  const data = await r.json();
+  showToast(r.ok ? `✓ ${processName} whitelisted` : `✗ Failed: ${data.detail || 'Error'}`);
+  if(r.ok) {
+    // Optimistically mark safe in current view
+    for (const pid in procs) {
+      if (procs[pid].name === processName) procs[pid].alerts = 0;
+    }
+    renderProcTable();
+  }
+}
+
+function updateInsight(){
+  const alertRatio = sessionAlerts / Math.max(sessionRows, 1);
+  const kbRatio = sessionKB / Math.max(sessionRows, 1);
+  let text;
+  if(sessionRows < 20){
+    text = 'Session starting. AI models warming up...';
+  } else if(alertRatio > 0.5 && kbRatio < 0.05){
+    text = `<strong>Heavy unfamiliar activity.</strong> ${sessionAlerts} anomalies across ${sessionRows} events. AI is actively learning your environment.`;
+  } else if(alertRatio < 0.05 && kbRatio > 0.4){
+    text = `<strong>Excellent session.</strong> ${Math.round(kbRatio*100)}% of activity recognized from learned signatures. Baseline is solid.`;
+  } else if(alertRatio > 0.1){
+    text = `<strong>${Math.round(alertRatio*100)}% anomaly rate.</strong> AI is observing new patterns. Accuracy improves with continued sessions.`;
+  } else {
+    text = '<strong>Normal session.</strong> System is stable. Monitoring quietly in the background.';
+  }
+  document.getElementById('insightText').innerHTML = text;
+}
+
+// ── OTP (admin) ──
+async function loadPendingOTPs(){
+  try {
+    const r = await fetch('/whitelist/pending');
+    if(!r.ok) return;
+    const data = await r.json();
+    const el = document.getElementById('otpList');
+    const el2 = document.getElementById('adminPendingRequests');
+    if(!data.length){
+      const empty = '<div style="color:var(--dim);font-size:12px;text-align:center;padding:16px">No pending requests.</div>';
+      el.innerHTML = empty;
+      if (el2) el2.innerHTML = empty;
+      return;
+    }
+    
+    // For Dashboard Sidebar
+    el.innerHTML = data.map(o => `
+      <div class="otp-item" id="side-otp-${esc(o.otp_code)}" style="flex-wrap: wrap;">
+        <div class="otp-info" style="flex-basis: 100%"><strong>${esc(o.process_name)}</strong> (PID ${esc(o.pid)})<br><span style="font-size:10px; color:var(--dim)">Requested by: <span style="color:#7289da">${esc(o.requested_by)}</span> on ${esc(o.machine_id)}</span></div>
+        <div style="display:flex; gap:6px; margin-top:8px;">
+          <button class="approve-btn" data-otp="${esc(o.otp_code)}" data-pid="${esc(o.pid)}" onclick="approveOTP(this.dataset.otp, this.dataset.pid)">Approve</button>
+          <button class="approve-btn" style="background:var(--red); color:#fff;" data-otp="${esc(o.otp_code)}" data-pid="${esc(o.pid)}" onclick="rejectOTP(this.dataset.otp)">Reject x Kill</button>
+          <button class="approve-btn" style="background:var(--surface2); border:1px solid var(--border); color:#fff;" data-otp="${esc(o.otp_code)}" data-pid="${esc(o.pid)}" onclick="rejectOTP(this.dataset.otp)">Reject x Ignore</button>
+        </div>
+      </div>`).join('');
+      
+    // For Admin Panel (Full controls)
+    if (el2) {
+      el2.innerHTML = data.map(o => `
+        <div class="otp-item" id="admin-otp-${o.otp_code}" style="flex-wrap: wrap;">
+          <div class="otp-info" style="flex-basis: 100%"><strong>${esc(o.process_name)}</strong> (PID ${esc(o.pid)})<br><span style="font-size:10px; color:var(--dim)">Requested by: <span style="color:#7289da">${o.requested_by}</span> on ${o.machine_id}</span></div>
+          <div style="display:flex; gap:6px; margin-top:8px;">
+            <button class="approve-btn" onclick="approveOTP('${o.otp_code}','${o.pid}')">✓ Whitelist</button>
+            <button class="approve-btn" style="background:var(--red); color:#fff;" onclick="rejectOTP('${o.otp_code}'); adminAction('kill', '${o.pid}', '${o.process_name}')">🗡 Reject x Kill</button>
+            <button class="approve-btn" style="background:var(--yellow); color:#fff;" onclick="rejectOTP('${o.otp_code}'); adminAction('suspend', '${o.pid}', '${o.process_name}')">⏸ Reject x Suspend</button>
+            <button class="approve-btn" style="background:var(--surface2); border:1px solid var(--border); color:#fff;" onclick="rejectOTP('${o.otp_code}'); adminAction('leave', '${o.pid}', '${o.process_name}')">→ Reject x Leave</button>
+          </div>
+        </div>`).join('');
+    }
+  } catch(e){}
+}
+
+async function approveOTP(code, pid) {
+  const adminRow = document.getElementById(`admin-otp-${code}`);
+  const sideRow = document.getElementById(`side-otp-${code}`);
+  if (adminRow) adminRow.remove();
+  if (sideRow) sideRow.remove();
+
+  const r = await fetch('/whitelist/approve', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({otp_code: code, pid: pid})
+  });
+  showToast(r.ok ? '✓ Whitelist approved!' : '✗ Failed to approve');
+  if(r.ok) loadAdminData();
+}
+
+async function rejectOTP(code) {
+  const adminRow = document.getElementById(`admin-otp-${code}`);
+  const sideRow = document.getElementById(`side-otp-${code}`);
+  if (adminRow) adminRow.remove();
+  if (sideRow) sideRow.remove();
+
+  await fetch(`/whitelist/pending/${code}`, { method:'DELETE' });
+}
+
+// ── User Whitelist Request ──
+async function requestWhitelist(pid, name) {
+  const r = await fetch('/whitelist/request', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({pid: pid, process_name: name})
+  });
+  showToast(r.ok ? `✓ Whitelist request sent to Admin` : `✗ Failed to request whitelist`);
+}
+
+async function adminAction(action, pid, name) {
+  const r = await fetch('/action', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({action: action, pid: pid, process_name: name})
+  });
+  
+  if (r.ok) {
+    showToast(`✓ ${action} command confirmed for ${name}`);
+    
+    // Page-Fault UI Pruning: Instantly wipe the process from local DOM and block ghost packets
+    if (action === 'kill' || action === 'suspend' || action === 'leave') {
+      deadPids.add(String(pid));
+      delete procs[String(pid)];
+      renderProcTable(); // Refresh table instantly without the dead row
+    }
+    
+    if (action === 'leave') {
+      await fetch('/ignored', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({pid: pid, process_name: name})
+      });
+    }
+    setTimeout(loadAdminData, 500);
+  } else {
+    showToast(`✗ Failed to execute ${action}`);
+  }
+}
+
+async function loadAdminData() {
+  loadPendingOTPs();
+  try {
+    const rIg = await fetch('/ignored');
+    if (rIg.ok) {
+      const igData = await rIg.json();
+      const igEl = document.getElementById('adminIgnoredList');
+      if (!igData.length) igEl.innerHTML = '<div style="color:var(--dim);font-size:12px;text-align:center;padding:16px">No ignored processes.</div>';
+      else igEl.innerHTML = igData.map(o => `
+        <div class="otp-item" style="display:flex; justify-content:space-between; align-items:center;">
+          <div class="otp-info"><strong>${esc(o.process_name)}</strong> (PID ${esc(o.pid)})<br><span style="font-size:10px; color:var(--dim)">Ignored At: ${new Date(o.ignored_at).toLocaleString()}</span></div>
+          <div style="display:flex; gap:4px;">
+            <button class="wl-btn" style="color:var(--green)" title="Direct Whitelist" onclick="directWhitelist('${o.process_name}', 'Unknown')">🛡</button>
+            <button class="wl-btn" style="color:var(--yellow)" title="Suspend" onclick="adminAction('suspend', '${o.pid}', '${o.process_name}')">⏸</button>
+            <button class="wl-btn" style="color:var(--red)" title="Kill" onclick="adminAction('kill', '${o.pid}', '${o.process_name}')">🗡</button>
+            <button class="wl-btn" style="color:#ff4757; opacity: 1; border: 1px solid var(--border); padding: 2px 6px; border-radius: 4px; margin-left: 8px;" title="Permanently Delete Record" onclick="deleteIgnored(${o.id})">✖</button>
+          </div>
+        </div>`).join('');
+    }
+    
+    const rUsr = await fetch('/users');
+    if (rUsr.ok) {
+      const usrData = await rUsr.json();
+      document.getElementById('adminUsersList').innerHTML = usrData.map((u, index) => {
+        let act = '';
+        if (currentUser.username === 'semsem400' && u.username !== 'semsem400') {
+            act = `<button class="logout-btn" style="padding:4px 8px;font-size:11px;color:var(--red);border-color:var(--red);" onclick="deleteUser(${u.id}, '${u.username}')">Delete</button>`;
+        }
+        if (u.role === 'pending_admin' && currentUser.username === 'semsem400') {
+            act = `<button class="approve-btn" onclick="approveRootAdmin(${u.id})">Approve Admin</button> ` + act;
+        }
+        let b = u.role === 'admin' ? 'badge-safe' : (u.role === 'user' ? 'badge-anomaly' : 'badge-pending');
+        return `
+        <tr>
+          <td>${index + 1}</td>
+          <td><strong>${u.username}</strong><br><span style="font-size:10px;color:var(--dim)">${u.email}</span></td>
+          <td><span class="badge ${b}">${u.role.toUpperCase()}</span></td>
+          <td style="color:var(--dim)">${new Date(u.created_at).toLocaleDateString()}</td>
+          <td>${act}</td>
+        </tr>
+      `}).join('');
+    }
+
+    const rWl = await fetch('/whitelist');
+    if (rWl.ok) {
+      const wlData = await rWl.json();
+      const elWl = document.getElementById('adminWhitelistTable');
+      if (!wlData.length) {
+          elWl.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--dim);">No whitelisted processes.</td></tr>';
+      } else {
+          // Fetch physical OS status
+          const names = wlData.map(w => w.exe_path || w.process_name);
+          let activeSet = new Set();
+          try {
+              const rStatus = await fetch('/processes/status', {
+                  method: 'POST', headers: {'Content-Type': 'application/json'},
+                  body: JSON.stringify({names: names})
+              });
+              if(rStatus.ok) {
+                  const sData = await rStatus.json();
+                  activeSet = new Set(sData.active || []);
+              }
+          } catch(e) {}
+          
+          elWl.innerHTML = wlData.map(w => {
+            const checkName = (w.exe_path || w.process_name).split('\\').pop().split('/').pop().toLowerCase();
+            const isRunning = activeSet.has(checkName);
+            const statusBadge = isRunning 
+              ? '<span class="badge badge-safe">ONLINE</span>' 
+              : '<span class="badge" style="background:#3a3a5c;color:#fff;">OFFLINE</span>';
+            const pathDisp = w.exe_path ? `<br><span style="font-size:10px;color:var(--dim);word-break:break-all;">Path: ${w.exe_path}</span>` : '';
+            return `
+            <tr>
+              <td><strong>${esc(w.process_name)}</strong>${pathDisp}</td>
+              <td>${statusBadge}</td>
+              <td>${w.approver_name || 'System'}</td>
+              <td style="color:var(--dim)">${new Date(w.approved_at).toLocaleDateString()}</td>
+              <td><button class="logout-btn" style="padding:4px 8px;font-size:11px;" onclick="revokeWhitelist(${w.id})">Revoke</button></td>
+            </tr>`;
+          }).join('');
+      }
+    }
+  } catch(e) {}
+}
+
+async function revokeWhitelist(id) {
+  if(!confirm('Are you sure you want to revoke this whitelist?')) return;
+  const r = await fetch(`/whitelist/${id}`, { method:'DELETE' });
+  showToast(r.ok ? '✓ Whitelist revoked' : '✗ Failed to revoke');
+  if(r.ok) loadAdminData();
+}
+
+async function deleteIgnored(id) {
+  if(!confirm('Permanently remove this exception? The process will be flagged normally again.')) return;
+  const r = await fetch(`/ignored/${id}`, { method:'DELETE' });
+  showToast(r.ok ? '✓ Ignored record permanently flushed' : '✗ Failed to flush');
+  if(r.ok) loadAdminData();
+}
+
+async function approveRootAdmin(id) {
+  if(!confirm('Grant this user full system administration access?')) return;
+  const r = await fetch(`/users/${id}/approve`, { method:'POST' });
+  showToast(r.ok ? '✓ Administrator approved' : '✗ Unauthorized');
+  if(r.ok) loadAdminData();
+}
+
+async function deleteUser(id, username) {
+  if(!confirm(`Are you sure you want to permanently delete the user '${username}'?`)) return;
+  const r = await fetch(`/users/${id}`, { method:'DELETE' });
+  showToast(r.ok ? `✓ User '${username}' deleted` : '✗ Failed to delete user');
+  if(r.ok) loadAdminData();
+}
+
+// ── Session history ──
+async function loadSessions(){
+  try {
+    const r = await fetch('/sessions');
+    const data = await r.json();
+    const el = document.getElementById('sessionHistory');
+    if(!data || !data.length){ el.innerHTML = '<tr><td colspan="5" style="text-align:center">No past sessions recorded yet.</td></tr>'; return; }
+    el.innerHTML = data.map(s => `
+      <tr class="clickable-row" onclick="window.open('/session/${s.id}', '_blank')">
+        <td style="color:var(--dim);font-size:11px">${s.machine_id ? s.machine_id.split('-')[0] : 'Unknown'}</td>
+        <td><strong>${new Date(s.start_time).toLocaleString()}</strong></td>
+        <td>${s.total_rows||0}</td>
+        <td style="color:${(s.total_alerts||0)>0?'var(--red)':'inherit'}">${s.total_alerts||0}</td>
+        <td><span style="color:${(s.health_score||0)>80?'var(--green)':'var(--red)'}">${Math.round(s.health_score||0)}%</span></td>
+      </tr>`).join('');
+  } catch(e){ document.getElementById('sessionHistory').innerHTML = '<tr><td colspan="5" style="text-align:center">Failed to load sessions.</td></tr>'; }
+}
+
+// ── Toast ──
+function showToast(msg){
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+// ── Boot ──
+async function boot() {
+  await checkAuth();
+  if (currentUser.role !== 'guest') {
+    try {
+      const r = await fetch('/dashboard/state');
+      if (r.ok) {
+          const state = await r.json();
+          procs = state.procs || {};
+          activityCounts = state.activityCounts || {};
+          
+          scoreLabels = state.scoreLabels || [];
+          scoreData = state.scoreData || [];
+          scoreChart.data.labels = scoreLabels;
+          scoreChart.data.datasets[0].data = scoreData;
+          scoreChart.update('none');
+          
+          const labels = Object.keys(activityCounts);
+          if (labels.length > 0) {
+              activityChart.data.labels = labels.map(l => `${l} (${activityCounts[l]})`);
+              activityChart.data.datasets[0].data = labels.map(l => activityCounts[l]);
+              activityChart.data.datasets[0].backgroundColor = labels.map(l => ACTIVITY_COLORS[l] || '#3a3a5c');
+              activityChart.update('none');
+          }
+          
+          let h = state.health || 100;
+          document.getElementById('healthDot').style.background = h > 80 ? '#1db954' : h > 55 ? '#ffd166' : '#ff4757';
+          document.getElementById('healthPct').textContent = `${Math.round(h)}%`;
+          
+          if (state.row_count !== undefined) {
+              sessionRows = state.row_count;
+              const el = document.getElementById('statRows');
+              if (el) el.textContent = sessionRows.toLocaleString();
+          }
+          if (state.alert_count !== undefined) {
+              sessionAlerts = state.alert_count;
+              const el = document.getElementById('statAlerts');
+              if (el) el.textContent = sessionAlerts.toLocaleString();
+          }
+          
+          renderProcTable();
+      }
+    } catch(e) {}
+  }
+  
+  // Garbage collect dead processes that stop sending metrics (manually closed games)
+  setInterval(() => {
+    const now = Date.now();
+    let changed = false;
+    for (const pid in procs) {
+      if (now - procs[pid].last_seen > 15000) {
+        delete procs[pid];
+        changed = true;
+      }
+    }
+    if (changed) renderProcTable();
+  }, 5000);
+  
+  connectWS();
+  setInterval(() => { if(currentUser.role === 'admin') loadPendingOTPs(); }, 15000);
+}
+
+boot();
+</script>
+</body>
+</html>
