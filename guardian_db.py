@@ -231,3 +231,74 @@ async def get_session_by_token(token):
         ) as c:
             row = await c.fetchone()
             return dict(row) if row else None
+async def delete_session(token):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM web_sessions WHERE token=?", (token,))
+        await db.commit()
+
+
+# ── OTP CRUD ──────────────────────────────────────────────────────────────────
+async def create_otp_request(pid, process_name, otp_code, expires_at, machine_id=None, requester="user", exe_path=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO otp_requests (pid, process_name, exe_path, otp_code, expires_at, machine_id, requested_by) VALUES (?,?,?,?,?,?,?)",
+            (pid, process_name, exe_path, otp_code, expires_at, machine_id or MACHINE_ID, requester)
+        )
+        await db.commit()
+
+async def get_pending_otps():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM otp_requests WHERE status='pending' AND expires_at > datetime('now') ORDER BY created_at DESC"
+        ) as c:
+            rows = await c.fetchall()
+            return [dict(r) for r in rows]
+
+async def validate_and_approve_otp(otp_code, pid, approved_by_user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM otp_requests WHERE otp_code=? AND pid=? AND status='pending' AND expires_at > datetime('now')",
+            (otp_code, pid)
+        ) as c:
+            row = await c.fetchone()
+            if not row:
+                return None
+            row = dict(row)
+        await db.execute(
+            "UPDATE otp_requests SET status='approved', approved_by=? WHERE id=?",
+            (approved_by_user_id, row['id'])
+        )
+        await db.execute(
+            "INSERT INTO whitelist_log (pid, process_name, exe_path, approved_by, otp_request_id) VALUES (?,?,?,?,?)",
+            (row['pid'], row['process_name'], row.get('exe_path'), approved_by_user_id, row['id'])
+        )
+        await db.commit()
+        return row
+
+async def create_whitelist_log(process_name: str, approved_by_user_id: int, exe_path: str = None):
+    """Fallback for direct web dashboard whitelists without OTP."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO whitelist_log (pid, process_name, exe_path, approved_by) VALUES (?,?,?,?)",
+            ("0", process_name, exe_path, approved_by_user_id)
+        )
+        await db.commit()
+
+
+# ── Session Events ─────────────────────────────────────────────────────────────
+async def save_session_event(start_time, end_time, total_rows, total_alerts,
+                              kb_matches, top_processes, conclusion_text,
+                              health_score, user_id=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO session_events
+               (machine_id, user_id, start_time, end_time, total_rows,
+                total_alerts, kb_matches, top_processes, conclusion_text, health_score)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (MACHINE_ID, user_id, start_time, end_time, total_rows,
+             total_alerts, kb_matches, json.dumps(top_processes),
+             conclusion_text, health_score)
+        )
+        await db.commit()
