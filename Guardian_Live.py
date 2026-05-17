@@ -316,4 +316,166 @@ def whitelist_tree(tgt_name, exe_path, brain):
         print(f"Error whitelisting tree: {e}")
     return count
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SESSION SUMMARY
+# ═══════════════════════════════════════════════════════════════════════════════
+def print_summary(stats, row_count, alert_count, start_time, brain):
+    elapsed = time.time() - start_time
+    health  = 100 * (1 - alert_count / max(row_count, 1))
 
+    print(f"\n\n{BOLD}{'═'*66}{RST}")
+    print(f"{BOLD}  SESSION REPORT  —  {time.strftime('%H:%M:%S')}{RST}")
+    print(f"{'═'*66}")
+
+    # ── Overview ─────────────────────────────────────────────────────────
+    mins, secs = divmod(int(elapsed), 60)
+    print(f"\n  {'Duration':<22} {mins}m {secs}s")
+    print(f"  {'Total rows processed':<22} {row_count:,}")
+    print(f"  {'Anomalies detected':<22} {alert_count:,}")
+    print(f"  {'KB matches':<22} {stats['kb_matches']:,}")
+    health_col = GRN if health > 80 else YEL if health > 60 else RED
+    bar = "█" * int(health/5) + "░" * (20 - int(health/5))
+    print(f"  {'System health':<22} {health_col}{health:.1f}%  [{bar}]{RST}")
+
+    # ── Activity breakdown ────────────────────────────────────────────────
+    print(f"\n  {BOLD}Activity Breakdown{RST}")
+    print(f"  {'─'*40}")
+    total_act = sum(stats['activity'].values()) or 1
+    for act, cnt in sorted(stats['activity'].items(), key=lambda x: -x[1]):
+        pct  = 100 * cnt / total_act
+        bar2 = "█" * int(pct / 4)
+        print(f"  {act:<22}  {pct:>5.1f}%  {bar2}")
+
+    # ── Top processes ─────────────────────────────────────────────────────
+    print(f"\n  {BOLD}Top Processes by Event Count{RST}")
+    print(f"  {'─'*60}")
+    print(f"  {'Process':<30} {'Events':>7} {'Alerts':>7} {'Avg GPU ms':>10}")
+    print(f"  {'─'*60}")
+    top = sorted(stats['procs'].items(), key=lambda x: -x[1]['events'])[:10]
+    for name, s in top:
+        avg_gpu = s['gpu_sum'] / max(s['events'], 1)
+        alert_col = RED if s['alerts'] > 0 else RST
+        print(f"  {name[:29]:<30} {s['events']:>7,} "
+              f"{alert_col}{s['alerts']:>7,}{RST} "
+              f"{avg_gpu:>10.2f}")
+
+    # ── Scoring system explanation ─────────────────────────────────────────
+    print(f"\n  {BOLD}Scoring System{RST}")
+    print(f"  {'─'*60}")
+    print(f"  IsoForest severity → safe if ≥ -0.40   anomaly if < -0.70")
+    print(f"  Ambiguous zone       -0.70 to -0.40  → Vault check + Ghost/LOF")
+    print(f"  KB radius check      normalized dist  → DEFINITE / PROBABLE / UNKNOWN")
+    print(f"  Tier 1 heuristic     pkts>200 & ms<1  → instant SUSPICIOUS_COPY flag")
+
+    # ── KB state ──────────────────────────────────────────────────────────
+    print(f"\n  {BOLD}Knowledge Bank State{RST}")
+    print(f"  {'─'*40}")
+    for sig in brain.knowledge.known_signatures:
+        name   = sig.get('name', sig.get('label', 'unknown'))[:35]
+        hits   = sig.get('hit_count', 0)
+        radius = sig.get('radius', 0)
+        print(f"  {name:<36}  hits={hits:>5}  radius={radius:>8.1f}")
+
+    print(f"\n{'═'*66}\n")
+    
+    # Save to API
+    try:
+        if _API_AVAILABLE:
+            import urllib.request, json
+            top_procs = [{'name': k, 'events': v['events']} for k,v in top]
+            data = {
+                "start_time": start_time,
+                "end_time": time.time(),
+                "total_rows": row_count,
+                "total_alerts": alert_count,
+                "kb_matches": stats.get('kb_matches', 0),
+                "top_processes": top_procs,
+                "health_score": health,
+                "conclusion_text": "Session Completed via Keyboard Interrupt"
+            }
+            req = urllib.request.Request("http://localhost:8080/sessions", 
+                data=json.dumps(data).encode('utf-8'),
+                headers={'Content-Type': 'application/json'})
+            urllib.request.urlopen(req, timeout=2.0)
+            print(f"{DIM}Session history persisted to Web Dashboard.{RST}")
+    except Exception as e:
+        print(f"{DIM}Could not save session to API: {e}{RST}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
+def main():
+    watch_dir = pick_watch_dir()
+    print(f"\n[Live] Watching: {BOLD}{watch_dir}{RST}")
+    print(f"[Live] Loading brain (this takes a few seconds)...")
+
+    brain = GuardianBrain()
+    brain.train_initial(watch_dir)
+
+    # Start Web API in background thread
+    if _API_AVAILABLE:
+        def _run_api():
+            _uvicorn.run("guardian_api:app", host="0.0.0.0", port=8080, log_level="warning")
+        api_thread = threading.Thread(target=_run_api, daemon=True)
+        api_thread.start()
+        print(f"[Live] Web dashboard available at {BOLD}http://localhost:8080{RST}")
+
+    tracker = PIDTracker(max_history=60)
+    sustained_detector = SustainedAttackDetector()
+    last_sustained_check = time.time()
+
+    # Session stats
+    stats = {
+        'activity':  collections.Counter(),
+        'procs':     collections.defaultdict(lambda: {'events': 0, 'alerts': 0, 'gpu_sum': 0.0}),
+        'kb_matches': 0,
+    }
+
+    latest      = None
+    file_handle = None
+    row_count   = 0
+    alert_count = 0
+    start_time  = time.time()
+
+    print_header(watch_dir, None)
+    print(f"  {DIM}Waiting for GPU logger CSV...{RST}\n")
+
+    try:
+        while True:
+            new_latest = get_latest_csv(watch_dir)
+
+            if new_latest != latest:
+                if file_handle:
+                    file_handle.close()
+                latest = new_latest
+                if latest:
+                    file_handle = open(latest, 'r', encoding='utf-8', errors='replace')
+                    file_handle.seek(0, 2)
+                    print_header(watch_dir, latest)
+
+            if not file_handle:
+                time.sleep(0.5)
+                continue
+
+            for raw in file_handle.readlines():
+                raw = raw.strip()
+                if not raw or raw.startswith("Timestamp"):
+                    continue
+
+                data = parse_line(raw)
+                if not data:
+                    continue
+
+                row_count += 1
+                category   = classify_activity(data)
+                vec        = [data[c] for c in brain.feature_cols]
+                name       = data.get('NAME', 'Unknown')
+                pid        = str(data.get('PID', '?'))
+
+                score, severity, aux = brain.predict_hybrid(
+                    vec, process_name=name
+                )
+                confidence, _        = brain.knowledge.is_known(
+                    vec, name_override=name
+                )
