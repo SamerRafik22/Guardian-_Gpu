@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Guardian — Create Account</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Inter', sans-serif; background: #1e1e2e; color: #e0e0f0; display: flex; align-items: center; justify-content: center; height: 100vh; }
+  .box { background: #252535; padding: 40px; border-radius: 16px; border: 1px solid #3a3a5c; width: 100%; max-width: 400px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+  .logo-icon { width: 50px; height: 50px; background: #00ff87; border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 24px; color: #1e1e2e; margin: 0 auto 20px; }
+  h2 { text-align: center; margin-bottom: 8px; font-weight: 700; color: #fff; }
+  p.sub { text-align: center; color: #888aaa; font-size: 14px; margin-bottom: 30px; }
+  .field { margin-bottom: 20px; }
+  label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 8px; color: #888aaa; }
+  input { width: 100%; padding: 12px 16px; background: #1e1e2e; border: 1px solid #3a3a5c; border-radius: 8px; color: #fff; font-family: inherit; font-size: 14px; outline: none; transition: border-color 0.2s; }
+  input:focus { border-color: #00ff87; }
+  .btn { width: 100%; padding: 14px; background: #00ff87; color: #1e1e2e; border: none; border-radius: 8px; font-weight: 700; font-size: 15px; cursor: pointer; font-family: inherit; transition: opacity 0.2s; }
+  .btn:hover { opacity: 0.9; }
+  #err { color: #ff4757; font-size: 13px; text-align: center; margin-top: 15px; display: none; }
+  .link { text-align: center; margin-top: 20px; font-size: 13px; color: #888aaa; }
+  .link a { color: #00ff87; text-decoration: none; font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="box">
+  <div class="logo-icon">🛡</div>
+  <h2>Create Account</h2>
+  <p class="sub">Join the Guardian telemetry network</p>
+  
+  <form id="f">
+    <div class="field">
+      <label>Username</label>
+      <input type="text" id="username" required>
+    </div>
+    <div class="field">
+      <label>Email</label>
+      <input type="email" id="email" required>
+    </div>
+    <div class="field">
+      <label>Password</label>
+      <input type="password" id="password" required minlength="6">
+    </div>
+    <div class="field" style="display:flex; align-items:center; gap:8px;">
+      <input type="checkbox" id="isAdmin" style="width:16px; height:16px;">
+      <label style="margin-bottom:0; font-weight:500;">Request Administrative Access</label>
+    </div>
+    <button type="submit" class="btn">Register</button>
+  </form>
+
+  <form id="otp_form" style="display: none;">
+    <p class="sub" style="margin-bottom: 20px;">We sent a 6-digit code to your email.</p>
+    <div class="field">
+      <label>Verification Code</label>
+      <input type="text" id="otp_code" required placeholder="123456" maxlength="6" autocomplete="off" style="font-size: 20px; text-align: center; letter-spacing: 4px;">
+    </div>
+    <button type="submit" class="btn">Verify Account</button>
+  </form>
+
+  <div id="err"></div>
+  <div class="link">Already have an account? <a href="/login">Sign In</a></div>
+</div>
+
+<script>
+document.getElementById('f').onsubmit = async (e) => {
+  e.preventDefault();
+  const u = document.getElementById('username').value;
+  const em = document.getElementById('email').value;
+  const p = document.getElementById('password').value;
+  const reqAdmin = document.getElementById('isAdmin').checked;
+  const btn = document.querySelector('#f .btn');
+  btn.textContent = 'Registering...';
+  
+  try {
+    const r = await fetch('/auth/register', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username: u, email: em, password: p, role: reqAdmin ? 'admin' : 'user'})
+    });
+    const d = await r.json();
+    if (r.ok && d.status === 'verification_required') {
+      document.getElementById('f').style.display = 'none';
+      document.getElementById('otp_form').style.display = 'block';
+      document.getElementById('err').style.display = 'none';
+      // Store email for verification step
+      window._signupEmail = em;
+    } else {
+      document.getElementById('err').textContent = d.detail || 'Registration failed';
+      document.getElementById('err').style.display = 'block';
+      btn.textContent = 'Register';
+    }
+  } catch(err) {
+    document.getElementById('err').textContent = 'Network error';
+    document.getElementById('err').style.display = 'block';
+    btn.textContent = 'Register';
+  }
+};
+
+document.getElementById('otp_form').onsubmit = async (e) => {
+  e.preventDefault();
+  const otp = document.getElementById('otp_code').value;
+  const btn = document.querySelector('#otp_form .btn');
+  btn.textContent = 'Verifying...';
+  
+  try {
+    const r = await fetch('/auth/verify-signup', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({email: window._signupEmail, otp_code: otp})
+    });
+    if (r.ok) {
+      window.location = '/login?registered=1';
+    } else {
+      const d = await r.json();
+      document.getElementById('err').textContent = d.detail || 'Invalid verification code';
+      document.getElementById('err').style.display = 'block';
+      btn.textContent = 'Verify Account';
+    }
+  } catch(err) {
+    document.getElementById('err').textContent = 'Network error';
+    document.getElementById('err').style.display = 'block';
+    btn.textContent = 'Verify Account';
+  }
+};
+</script>
+</body>
+</html>
