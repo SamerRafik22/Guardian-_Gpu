@@ -452,3 +452,236 @@ class KnowledgeBank:
             pass
 
 
+# =============================================================================
+# RETRIEVAL BUFFER — cold storage reader for LOF
+# =============================================================================
+class RetrievalBuffer:
+    MAX_NEIGHBORHOOD = 2000
+
+    def __init__(self, archive_path=ARCHIVE_PATH, vault_path=VAULT_PATH):
+        self.archive_path = archive_path
+        self.vault_path   = vault_path
+
+    def get_neighborhood(self, query_vec, n=1000):
+        """Return a 2D numpy array of neighborhood vectors.
+        Dimensionality matches len(query_vec) — archive (2D) columns are
+        zero-padded to 6D so LOF vstack never gets a shape mismatch.
+        """
+        rows = []
+        n_dim = len(query_vec) if query_vec is not None else 6
+        n    = min(n, self.MAX_NEIGHBORHOOD)
+
+        if os.path.exists(self.archive_path):
+            try:
+                data    = np.load(self.archive_path, allow_pickle=True)
+                times   = data['time_ms'].astype(float)
+                packets = data['packet_count'].astype(float)
+                if len(times) > 0:
+                    idx      = np.random.choice(len(times), min(n, len(times)), replace=False)
+                    base     = np.column_stack([times[idx], packets[idx]])  # (k, 2)
+                    # Pad to n_dim so LOF dataset is uniform
+                    padding  = np.zeros((len(idx), max(0, n_dim - 2)))
+                    rows.append(np.hstack([base, padding]))          # (k, n_dim)
+            except Exception:
+                pass
+
+        needed = n - sum(len(r) for r in rows)
+        if needed > 0 and os.path.exists(self.vault_path):
+            try:
+                vault_rows = []
+                with gzip.open(self.vault_path, 'rt', encoding='utf-8') as f:
+                    for line in f:
+                        try:
+                            rec = json.loads(line)
+                            if isinstance(rec, (list, tuple)) and len(rec) >= 2:
+                                # Pad or truncate to n_dim for consistency
+                                vec = list(rec)[:n_dim]
+                                while len(vec) < n_dim:
+                                    vec.append(0.0)
+                                vault_rows.append(vec)
+                        except:
+                            continue
+                if vault_rows:
+                    vr  = np.array(vault_rows, dtype=float)
+                    idx = np.random.choice(len(vr), min(needed, len(vr)), replace=False)
+                    rows.append(vr[idx])
+            except Exception:
+                pass
+
+        return np.vstack(rows) if rows else None
+
+    def get_archive_sample(self, n=5000):
+        if not os.path.exists(self.archive_path):
+            return None
+        try:
+            data    = np.load(self.archive_path, allow_pickle=True)
+            times   = data['time_ms'].astype(float)
+            packets = data['packet_count'].astype(float)
+            labels  = data['activity'].astype(str) if 'activity' in data \
+                      else np.array(['unknown'] * len(times))
+            classes = np.unique(labels)
+            per_cls = max(1, n // len(classes))
+            chosen  = []
+            for cls in classes:
+                mask = labels == cls
+                t, p = times[mask], packets[mask]
+                idx  = np.random.choice(len(t), min(per_cls, len(t)), replace=False)
+                chosen.append(np.column_stack([t[idx], p[idx]]))
+            result = np.vstack(chosen)
+            np.random.shuffle(result)
+            return result[:n]
+        except Exception:
+            return None
+
+
+# =============================================================================
+# BACKGROUND ANALYZER — Ghost Thread with LOF (Tier 4)
+# =============================================================================
+class BackgroundAnalyzer(threading.Thread):
+    LOF_NEIGHBORS    = 20
+    LOF_THRESHOLD    = -1.5
+    MIN_NEIGHBORHOOD = 30
+
+    def __init__(self, knowledge_bank, retrieval_buffer):
+        super().__init__()
+        self.kb      = knowledge_bank
+        self.rbuf    = retrieval_buffer
+        self.queue   = queue.Queue()
+        self.running = True
+        self.daemon  = True
+
+    def run(self):
+        print("[Ghost] Thread online. LOF engine ready.")
+        while self.running:
+            try:
+                _, data_row, iso_severity = self.queue.get(timeout=1.0)
+                neighborhood  = self.rbuf.get_neighborhood(data_row, n=1000)
+                final_verdict = self._run_lof(data_row, neighborhood, iso_severity)
+
+                if final_verdict == "LOF_SAFE":
+                    self.kb.auto_candidate(data_row)
+                    print(f"\n[Ghost] ✓ LOF_SAFE vec={[round(x,2) for x in data_row]}")
+                else:
+                    print(f"\n[Ghost] ✗ LOF_THREAT iso={iso_severity:.3f}")
+                self.queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"[Ghost] Error: {e}")
+
+    def _run_lof(self, data_row, neighborhood, iso_severity):
+        if neighborhood is None or len(neighborhood) < self.MIN_NEIGHBORHOOD:
+            return "LOF_SAFE" if iso_severity > -0.55 else "LOF_THREAT"
+        try:
+            query = np.array(data_row, dtype=float).reshape(1, -1)
+            n_dim = query.shape[1]
+            # Ensure neighborhood matches query dimensionality (pad/trim)
+            nb = neighborhood
+            if nb.shape[1] != n_dim:
+                if nb.shape[1] < n_dim:
+                    pad = np.zeros((nb.shape[0], n_dim - nb.shape[1]))
+                    nb  = np.hstack([nb, pad])
+                else:
+                    nb = nb[:, :n_dim]
+            dataset = np.vstack([nb, query])
+            k       = min(self.LOF_NEIGHBORS, len(dataset) - 1)
+            lof     = LocalOutlierFactor(n_neighbors=k, contamination=0.05)
+            lof.fit_predict(dataset)
+            score = lof.negative_outlier_factor_[-1]
+            return "LOF_THREAT" if score < self.LOF_THRESHOLD else "LOF_SAFE"
+        except Exception:
+            return "LOF_SAFE" if iso_severity > -0.55 else "LOF_THREAT"
+
+    def submit(self, data_row, iso_severity):
+        self.queue.put((1, data_row, iso_severity))
+
+
+# =============================================================================
+# GUARDIAN VAULT — Compressed append-only storage (unknown-safe events only)
+# =============================================================================
+class GuardianVault:
+    def __init__(self, vault_path=VAULT_PATH):
+        self.vault_path = vault_path
+
+    def flush(self, data_chunk):
+        """Append data to Vault. Enforces VAULT_MAX_ENTRIES cap with rotation."""
+        if not data_chunk:
+            return
+        try:
+            with gzip.open(self.vault_path, 'ab') as f:
+                for row in data_chunk:
+                    f.write((json.dumps(row) + "\n").encode('utf-8'))
+            print(f"[Vault] Secured {len(data_chunk)} memories.")
+            self._rotate_if_needed()
+        except Exception as e:
+            print(f"[Vault] Flush Failed: {e}")
+
+    def _rotate_if_needed(self):
+        """Drop oldest entries if vault exceeds VAULT_MAX_ENTRIES."""
+        if not os.path.exists(self.vault_path):
+            return
+        try:
+            lines = []
+            with gzip.open(self.vault_path, 'rt', encoding='utf-8') as f:
+                lines = f.readlines()
+            if len(lines) <= VAULT_MAX_ENTRIES:
+                return
+            lines = lines[-VAULT_MAX_ENTRIES:]   # keep newest
+            with gzip.open(self.vault_path, 'wt', encoding='utf-8') as f:
+                f.writelines(lines)
+            print(f"[Vault] Rotated to {VAULT_MAX_ENTRIES} entries.")
+        except Exception:
+            pass
+
+    def audit(self, query_vector, tolerance=None):
+        """Check if a similar vector exists in vault.
+        Tolerance scales with vector magnitude (10% of query norm) so it
+        works correctly for any feature scale, not just tiny 2D values.
+        """
+        if not os.path.exists(self.vault_path):
+            return False
+        query = np.array(query_vector, dtype=float)
+        if tolerance is None:
+            tolerance = max(np.linalg.norm(query) * 0.10, 5.0)  # min 5.0
+        try:
+            with gzip.open(self.vault_path, 'rt', encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        record = json.loads(line)
+                        rec_arr = np.array(record, dtype=float)
+                        # Align dimensions
+                        if len(rec_arr) < len(query):
+                            rec_arr = np.pad(rec_arr, (0, len(query) - len(rec_arr)))
+                        elif len(rec_arr) > len(query):
+                            rec_arr = rec_arr[:len(query)]
+                        if np.linalg.norm(query - rec_arr) < tolerance:
+                            return True
+                    except:
+                        continue
+        except Exception:
+            pass
+        return False
+
+
+# =============================================================================
+# SLIDING WINDOW GATE — per-process sustained anomaly detector
+# =============================================================================
+class SlidingWindowGate:
+    """Keeps a rolling window of score verdicts per process.
+
+    Returns True (fire alert) only when >= SLIDE_WINDOW_THRESHOLD of the
+    last SLIDE_WINDOW_SIZE readings are anomalous.  Single spikes = ignored.
+    """
+
+    def __init__(self):
+        # {process_name: deque of bool (True=anomaly)}
+        self._windows: dict[str, collections.deque] = {}
+
+    def push(self, name: str, is_anomaly: bool) -> bool:
+        """Push verdict and return True if sustained gate fires."""
+        if name not in self._windows:
+            self._windows[name] = collections.deque(maxlen=SLIDE_WINDOW_SIZE)
+        self._windows[name].append(is_anomaly)
+        count = sum(self._windows[name])
+        return count >= SLIDE_WINDOW_THRESHOLD
+
