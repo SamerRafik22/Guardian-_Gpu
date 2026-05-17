@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Guardian — First Setup</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family:'Inter',sans-serif; background:#1e1e2e; color:#e0e0f0;
+         min-height:100vh; display:flex; align-items:center; justify-content:center; }
+  .card { background:#252535; border-radius:16px; padding:40px; width:400px;
+          border:1px solid #3a3a5c; box-shadow:0 20px 60px rgba(0,0,0,0.4); }
+  .logo { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
+  .logo-icon { width:44px; height:44px; background:#00ff87; border-radius:12px;
+               display:flex; align-items:center; justify-content:center; font-size:22px; }
+  .logo-text { font-size:24px; font-weight:700; }
+  .badge { display:inline-block; background:rgba(255,71,87,0.15); color:#ff4757;
+            border-radius:6px; padding:3px 10px; font-size:11px; font-weight:600; margin-bottom:18px; }
+  p { font-size:13px; color:#888aaa; margin-bottom:20px; line-height:1.6; }
+  label { display:block; font-size:12px; color:#888aaa; margin-bottom:6px; margin-top:14px; }
+  input { width:100%; padding:10px 14px; background:#1e1e2e; border:1px solid #3a3a5c;
+          border-radius:8px; color:#e0e0f0; font-size:14px; outline:none; transition:border 0.15s; }
+  input:focus { border-color:#00ff87; }
+  .btn { width:100%; padding:12px; margin-top:22px; border-radius:8px; border:none;
+         background:#00ff87; color:#1e1e2e; font-size:14px; font-weight:700; cursor:pointer; }
+  .btn:hover { opacity:0.9; }
+  .err { color:#ff4757; font-size:12px; margin-top:10px; text-align:center; min-height:18px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">
+    <div class="logo-icon">🛡</div>
+    <span class="logo-text">Guardian</span>
+  </div>
+  <span class="badge">⚡ First-Time Setup</span>
+  <p>No administrator account exists yet. Create the <strong>master admin account</strong> to unlock the full dashboard. This only happens once.</p>
+  <label for="username">Admin Username</label>
+  <input type="text" id="username" placeholder="Choose a username">
+  <label for="email">Admin Email</label>
+  <input type="email" id="email" placeholder="For OTP approvals">
+  <label for="password">Password</label>
+  <input type="password" id="password" placeholder="Min 8 characters">
+  <button class="btn" onclick="doSetup()">Create Admin Account</button>
+  <div class="err" id="err"></div>
+</div>
+<script>
+async function doSetup(){
+  const username = document.getElementById('username').value.trim();
+  const email = document.getElementById('email').value.trim();
+  const password = document.getElementById('password').value;
+  if(!username||!email||!password){ document.getElementById('err').textContent='All fields required.'; return; }
+  if(password.length<8){ document.getElementById('err').textContent='Password must be at least 8 characters.'; return; }
+  const r = await fetch('/auth/setup',{
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({username, email, password})
+  });
+  if(r.ok){ window.location='/login'; }
+  else { document.getElementById('err').textContent='Setup failed — account may already exist.'; }
+}
+</script>
+</body>
+</html>
