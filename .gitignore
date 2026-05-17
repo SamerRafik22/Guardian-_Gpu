@@ -1,0 +1,17 @@
+# Python Cache
+__pycache__/
+*.pyc
+
+# Databases
+*.db
+
+# Logs & Vault Data
+*.csv
+*.npz
+*.gz
+*.jsonl.gz
+
+# Build Outputs
+build/
+*.exe
+*.obj
