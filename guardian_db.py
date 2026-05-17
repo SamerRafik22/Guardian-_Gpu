@@ -302,3 +302,80 @@ async def save_session_event(start_time, end_time, total_rows, total_alerts,
              conclusion_text, health_score)
         )
         await db.commit()
+async def get_session_history(machine_id=None, limit=20):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if machine_id:
+            q = "SELECT * FROM session_events WHERE machine_id=? ORDER BY start_time DESC LIMIT ?"
+            args = (machine_id, limit)
+        else:
+            q = "SELECT * FROM session_events ORDER BY start_time DESC LIMIT ?"
+            args = (limit,)
+        async with db.execute(q, args) as c:
+            rows = await c.fetchall()
+            return [dict(r) for r in rows]
+
+async def get_all_machines():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT DISTINCT machine_id FROM session_events") as c:
+            rows = await c.fetchall()
+            return [r[0] for r in rows if r[0]]
+
+async def get_session_by_id(session_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM session_events WHERE id=?", (session_id,)) as c:
+            row = await c.fetchone()
+            if row:
+                d = dict(row)
+                if d.get('top_processes'):
+                    try:
+                        d['top_processes'] = json.loads(d['top_processes'])
+                    except: pass
+                return d
+            return None
+
+# ── Ignored Processes ─────────────────────────────────────────────────────────
+async def log_ignored_process(pid, process_name, machine_id=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO ignored_processes (pid, process_name, machine_id) VALUES (?,?,?)",
+            (pid, process_name, machine_id or MACHINE_ID)
+        )
+        await db.commit()
+
+async def get_ignored_processes():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM ignored_processes ORDER BY ignored_at DESC LIMIT 100") as c:
+            rows = await c.fetchall()
+            return [dict(r) for r in rows]
+
+async def delete_ignored_process(log_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM ignored_processes WHERE id=?", (log_id,))
+        await db.commit()
+
+# ── Permanent Whitelist Log ───────────────────────────────────────────────────
+async def get_whitelist_log():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT wl.*, u.username as approver_name FROM whitelist_log wl "
+            "LEFT JOIN users u ON wl.approved_by = u.id "
+            "ORDER BY wl.approved_at DESC LIMIT 100"
+        ) as c:
+            rows = await c.fetchall()
+            return [dict(r) for r in rows]
+
+async def delete_whitelist_log(log_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT process_name FROM whitelist_log WHERE id=?", (log_id,)) as c:
+            row = await c.fetchone()
+            name = row['process_name'] if row else None
+            
+        if name:
+            await db.execute("DELETE FROM whitelist_log WHERE id=?", (log_id,))
+            await db.commit()
+        return name
