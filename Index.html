@@ -206,3 +206,211 @@
         </div>
       </div>
     </div>
+
+    <!-- Sessions Section -->
+    <div class="section" id="section-sessions">
+      <div class="card">
+        <div class="card-title">Session History</div>
+        <div class="table-wrap">
+          <table class="proc-table">
+            <thead><tr><th>Machine ID</th><th>Date</th><th>Events</th><th>Alerts</th><th>Health</th></tr></thead>
+            <tbody id="sessionHistory"><tr><td colspan="5" style="text-align:center">Loading...</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Admin Panel Section -->
+    <div class="section" id="section-admin">
+      <div class="bottom-row" style="margin-bottom:20px;">
+        <div class="card">
+          <div class="card-title">Pending Whitelist Requests</div>
+          <div class="otp-list" id="adminPendingRequests"><div style="color:var(--dim);font-size:12px;text-align:center;padding:16px">No pending requests.</div></div>
+        </div>
+        <div class="card">
+          <div class="card-title">Ignored Processes</div>
+          <div class="otp-list" id="adminIgnoredList"><div style="color:var(--dim);font-size:12px;text-align:center;padding:16px">No ignored processes.</div></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">Permanent Whitelist</div>
+        <div class="table-wrap">
+          <table class="proc-table">
+            <thead><tr><th>Process</th><th>Status</th><th>Approved By</th><th>Date</th><th>Action</th></tr></thead>
+            <tbody id="adminWhitelistTable"><tr><td colspan="5" style="text-align:center">Loading...</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">Registered Users</div>
+        <div class="table-wrap">
+          <table class="proc-table">
+            <thead><tr><th>ID</th><th>Username</th><th>Role</th><th>Registered</th><th>Action</th></tr></thead>
+            <tbody id="adminUsersList"><tr><td colspan="5" style="text-align:center">Loading...</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div id="toast"></div>
+
+<script>
+// ── State ──
+let currentUser = {role:'guest', username:'Guest'};
+let procs = {};
+let activityCounts = {};
+let sessionRows = 0, sessionAlerts = 0, sessionKB = 0;
+let scoreData = [], scoreLabels = [];
+let wsRetries = 0;
+let deadPids = new Set();
+
+// ── Render throttle — batches DOM updates to max 60fps via rAF ──
+let _renderScheduled = false;
+let _chartDirty = false;
+let _lastIsAnomaly = false;
+// Security: HTML escape to prevent XSS via process names in innerHTML
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = String(s ?? '');
+  return d.innerHTML;
+}
+
+function scheduleRender() {
+  if (_renderScheduled) return;
+  _renderScheduled = true;
+  requestAnimationFrame(() => {
+    if (_chartDirty) {
+      scoreChart.data.datasets[0].borderColor = _lastIsAnomaly ? '#ff4757' : '#00ff87';
+      scoreChart.update('none');
+      activityChart.update('none');
+      _chartDirty = false;
+    }
+    renderProcTable();
+    updateInsight();
+    _renderScheduled = false;
+  });
+}
+
+const scoreChart = new Chart(
+  document.getElementById('scoreChart').getContext('2d'), {
+  type:'line',
+  data:{ labels: scoreLabels, datasets:[{
+    label:'Severity', data: scoreData,
+    borderColor:'#00ff87', borderWidth:2, pointRadius:0, tension:0.4,
+    fill:true, backgroundColor:'rgba(0,255,135,0.06)'
+  }]},
+  options:{
+    animation:false, responsive:true, maintainAspectRatio:false,
+    scales:{
+      x:{display:false},
+      y:{min:-1.0, max:1.0, grid:{color:'rgba(255,255,255,0.04)'},
+         ticks:{stepSize:0.1, color:'#888aaa',font:{size:10}}}
+    },
+    plugins:{legend:{display:false}}
+  }
+});
+
+const ACTIVITY_COLORS = {'Gaming':'#1db954','3D/UI Activity':'#7289da','Compute':'#ffd166','Idle':'#444466','SUSPICIOUS_COPY':'#ff4757','Unknown':'#3a3a5c'};
+const activityChart = new Chart(
+  document.getElementById('activityChart').getContext('2d'), {
+  type:'doughnut',
+  data:{labels:['Waiting'],datasets:[{data:[1],backgroundColor:['#2d2d45'],borderWidth:0}]},
+  options:{responsive:true,maintainAspectRatio:false,cutout:'70%',
+    plugins:{legend:{position:'bottom',labels:{color:'#888aaa',boxWidth:10,font:{size:11}}}}}
+});
+
+// ── Auth ──
+async function checkAuth(){
+  try {
+    const r = await fetch('/auth/me');
+    const u = await r.json();
+    currentUser = u;
+    document.getElementById('sbUsername').textContent = u.username || 'Guest';
+    document.getElementById('sbRole').textContent =
+      u.role === 'admin' ? '🔑 Admin' : u.role === 'user' ? 'User' : 'Guest';
+    if(u.role !== 'guest'){
+      document.getElementById('authActions').innerHTML =
+        '<button class="logout-btn" onclick="logout()">Sign Out</button>';
+    }
+    if(u.role === 'admin'){
+      document.getElementById('nav-admin').style.display = 'flex';
+      document.getElementById('adminOTPSection').style.display = 'block';
+      loadPendingOTPs();
+    }
+  } catch(e) {}
+}
+
+async function logout(){
+  await fetch('/auth/logout', {method:'POST'});
+  window.location.reload();
+}
+
+// ── Navigation ──
+function showSection(name, el){
+  document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  const sec = document.getElementById('section-' + name);
+  if(sec) sec.classList.add('active');
+  if(el) el.classList.add('active');
+  const titles = {dashboard:'Live Dashboard', sessions:'Session History', admin:'Admin Panel'};
+  document.getElementById('sectionTitle').textContent = titles[name] || '';
+  if(name === 'sessions') loadSessions();
+  if(name === 'admin' && currentUser.role === 'admin') loadAdminData();
+}
+
+// ── WebSocket ──
+function connectWS(){
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/ws/stream`);
+  ws.onopen = () => { wsRetries = 0; };
+  ws.onmessage = (e) => {
+    try {
+      // Server now sends a JSON array of events per frame
+      const parsed = JSON.parse(e.data);
+      const events = Array.isArray(parsed) ? parsed : [parsed];
+      for (const ev of events) {
+        if (ev.type === 'ping') continue;
+        handleEvent(ev);
+      }
+    } catch(_) {}
+  };
+  ws.onclose = () => {
+    const delay = Math.min(1000 * Math.pow(1.5, wsRetries), 10000);
+    wsRetries++;
+    setTimeout(connectWS, delay);
+  };
+}
+
+function handleEvent(ev){
+  // Handle Admin Notifications instantly from WebSockets
+  if (ev.type === 'whitelist_requested' && currentUser.role === 'admin') {
+    showToast(`🔔 Whitelist Request: ${ev.name} (PID: ${ev.pid})`);
+    loadPendingOTPs();
+    return;
+  }
+
+  if(ev.type !== 'verdict') return;
+  
+  // ── Prune ghost packets for recently killed/suspended processes ──
+  const pid = String(ev.pid || 'unknown');
+  if (deadPids.has(pid)) return;
+
+  sessionRows++;
+  document.getElementById('statRows').textContent = sessionRows.toLocaleString();
+
+  if(ev.score === -1){
+    sessionAlerts++;
+    document.getElementById('statAlerts').textContent = sessionAlerts;
+  }
+  if(ev.kb_match){
+    sessionKB++;
+    document.getElementById('statKB').textContent = sessionKB;
+  }
+
+  // Health
+  const health = Math.max(0, 100 - (sessionAlerts / Math.max(sessionRows, 1)) * 100);
+  document.getElementById('healthPct').textContent = Math.round(health) + '%';
+  const dot = document.getElementById('healthDot');
+  dot.style.background = health > 80 ? '#1db954' : health > 55 ? '#ffd166' : '#ff4757';
