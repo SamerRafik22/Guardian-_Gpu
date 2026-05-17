@@ -161,3 +161,159 @@ def _show_popup_sync(data, vec, severity, category, brain):
             root.quit(); root.destroy()
         except:
             pass
+    def kill_process():
+        try:
+            killed_pids = windows_killer.force_kill_tree(int(pid), name)
+            if killed_pids:
+                status_var.set(f"✓ {name} terminated ({len(killed_pids)} process(es)).")
+            else:
+                status_var.set(f"✓ {name} terminated (syscall).")
+            set_cooldown() # Prevent instantaneous re-alerts before OS cleans up
+            root.after(1200, _safe_close)
+        except Exception as e:
+            status_var.set(f"Kill failed: {e}")
+
+    def suspend_process():
+        try:
+            import psutil
+            psutil.Process(int(pid)).suspend()
+            status_var.set(f"⏸ PID {pid} suspended.")
+            root.after(1200, _safe_close)
+        except ImportError:
+            status_var.set("Install psutil for suspend")
+        except Exception as e:
+            status_var.set(f"Suspend failed: {e}")
+
+    def request_whitelist():
+        try:
+            import urllib.request, json
+            import psutil
+            mid = _api.MACHINE_ID if _API_AVAILABLE else "local"
+            
+            # Fetch full path if achievable
+            try:
+                exe_path = psutil.Process(int(pid)).exe()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                exe_path = name
+                
+            req = urllib.request.Request("http://localhost:8080/whitelist/request", 
+                data=json.dumps({"pid": pid, "process_name": name, "exe_path": exe_path, "machine_id": mid}).encode('utf-8'),
+                headers={'Content-Type': 'application/json'})
+            urllib.request.urlopen(req)
+            status_var.set(f"✓ Request sent to Admin.")
+            set_cooldown() # Wait 5 minutes for admin to respond
+            root.after(1400, _safe_close)
+        except Exception as e:
+            status_var.set(f"Request failed: {e}")
+
+    def leave_process():
+        try:
+            import urllib.request, json
+            mid = _api.MACHINE_ID if _API_AVAILABLE else "local"
+            req = urllib.request.Request("http://localhost:8080/ignored", 
+                data=json.dumps({"pid": pid, "process_name": name, "machine_id": mid}).encode('utf-8'),
+                headers={'Content-Type': 'application/json'})
+            urllib.request.urlopen(req)
+        except Exception:
+            pass
+        set_cooldown() # 5 minute cooldown
+        _safe_close()
+
+    btn_cfg = dict(font=("Segoe UI", 9, "bold"), width=15,
+                   relief="flat", cursor="hand2", pady=5)
+
+    tk.Button(btn_frame, text="🗡 Kill",
+              bg="#e94560", fg="white", command=kill_process,
+              **btn_cfg).pack(side="left", padx=4)
+    tk.Button(btn_frame, text="⏸ Suspend",
+              bg="#f4a261", fg="white", command=suspend_process,
+              **btn_cfg).pack(side="left", padx=4)
+    
+    btn_frame_bottom = tk.Frame(root, bg="#1a1a2e", pady=5)
+    btn_frame_bottom.pack()
+    
+    tk.Button(btn_frame_bottom, text="🛡 Request Whitelist",
+              bg="#06d6a0", fg="#1a1a2e", command=request_whitelist,
+              **btn_cfg).pack(side="left", padx=4)
+    tk.Button(btn_frame_bottom, text="→ Leave",
+              bg="#444", fg="white", command=leave_process,
+              **btn_cfg).pack(side="left", padx=4)
+
+    root.mainloop()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+def pick_watch_dir():
+    if os.path.isdir(WATCH_DIR) and glob.glob(os.path.join(WATCH_DIR, "gpu_log_*.csv")):
+        return WATCH_DIR
+    return FALLBACK_DIR
+
+def get_latest_csv(watch_dir):
+    files = glob.glob(os.path.join(watch_dir, "gpu_log_*.csv"))
+    return max(files, key=os.path.getmtime) if files else None
+
+def activity_icon(cat):
+    icons = {
+        "Gaming":          MAG  + "🎮 Gaming"    + RST,
+        "Compute":         YEL  + "⚙  Compute"   + RST,
+        "3D/UI Activity":  CYN  + "🖥  3D/UI"     + RST,
+        "Idle":            DIM  + "💤 Idle"       + RST,
+    }
+    return icons.get(cat, DIM + cat + RST)
+
+def verdict_str(score, severity, confidence, category, aux=None):
+    if isinstance(aux, list) and "SUSTAINED_COMPUTE_TRAP" in aux:
+         return f"{RED+BOLD}✗ SUSTAINED COMPUTE{RST}"
+    if isinstance(aux, list) and "GRACE_WINDOW" in aux:
+        return f"{DIM}⏳ GRACE  (learning){RST}"
+    if isinstance(aux, list) and "System Whitelisted" in aux:
+        return f"{GRN}✓ SYS WL{RST}"
+    if isinstance(aux, list) and "Admin Whitelisted" in aux:
+        return f"{GRN}✓ ADM WL{RST}"
+    if score == -1:
+        return f"{RED}✗ ANOMALY  [{severity:.3f}]{RST}"
+    if confidence == KnowledgeBank.DEFINITE_SAFE:
+        return f"{GRN}✓ KB SAFE{RST}"
+    if confidence == KnowledgeBank.PROBABLE_SAFE:
+        return f"{CYN}~ PROBABLE SAFE{RST}"
+    return f"{YEL}? ML OK  [{severity:.3f}]{RST}"
+
+def print_header(watch_dir, csv_path):
+    print(f"\n{BOLD}{'═'*80}{RST}")
+    print(f"{BOLD}  GUARDIAN  —  Live GPU Monitor{RST}")
+    print(f"  Watching : {DIM}{csv_path or watch_dir}{RST}")
+    print(f"{BOLD}{'─'*80}{RST}")
+    print(f"  {'PID':<8} {'PROCESS':<24} {'Activity':<16} "
+          f"{'Pwr(W)':>6} {'Mem(MB)':>8} {'GPU(ms)':>7} {'Pkts':>7}  Verdict")
+
+def whitelist_tree(tgt_name, exe_path, brain):
+    """Add process + children to both the in-memory whitelist and KB."""
+    brain.whitelist.add_admin_live(tgt_name)
+    brain.knowledge.add_admin_whitelist(tgt_name)
+    count = 1
+    try:
+        import psutil
+        for p in psutil.process_iter(['name', 'exe']):
+            if p.info['name'] == tgt_name or (exe_path and p.info['exe'] == exe_path):
+                if p.info['name'] and p.info['name'] != tgt_name:
+                    brain.whitelist.add_admin_live(p.info['name'])
+                    brain.knowledge.add_admin_whitelist(p.info['name'])
+                    count += 1
+                try:
+                    for child in p.children(recursive=True):
+                        try:
+                            cname = child.name()
+                            if cname and cname != tgt_name:
+                                brain.whitelist.add_admin_live(cname)
+                                brain.knowledge.add_admin_whitelist(cname)
+                                count += 1
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+                except:
+                    pass
+    except Exception as e:
+        print(f"Error whitelisting tree: {e}")
+    return count
+
+
