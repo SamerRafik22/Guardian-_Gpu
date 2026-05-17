@@ -414,3 +414,214 @@ function handleEvent(ev){
   document.getElementById('healthPct').textContent = Math.round(health) + '%';
   const dot = document.getElementById('healthDot');
   dot.style.background = health > 80 ? '#1db954' : health > 55 ? '#ffd166' : '#ff4757';
+
+  // Score chart (-1.0 to 1.0)
+  const t = new Date(ev.ts * 1000).toLocaleTimeString();
+  scoreLabels.push(t);
+  let severityVal = typeof ev.severity === 'number' ? ev.severity : 0;
+  if (severityVal > 1.0) severityVal = 1.0;
+  
+  let plotVal = 0;
+  if(ev.score === -1) {
+    plotVal = -Math.max(severityVal, 0.2); // Anomaly plotting
+  } else {
+    plotVal = Math.max(1.0 - severityVal, 0.1); // Safe plotting
+  }
+  scoreData.push(plotVal);
+  if(scoreLabels.length > 80){ scoreLabels.shift(); scoreData.shift(); }
+  // Mark chart dirty — actual redraw batched in scheduleRender()
+  _lastIsAnomaly = ev.score === -1;
+
+  // Activity donut — update data only, defer render
+  const cat = ev.category || 'Unknown';
+  activityCounts[cat] = (activityCounts[cat] || 0) + 1;
+  const labels = Object.keys(activityCounts);
+  activityChart.data.labels = labels.map(l => `${l} (${activityCounts[l]})`);
+  activityChart.data.datasets[0].data = labels.map(l => activityCounts[l]);
+  activityChart.data.datasets[0].backgroundColor = labels.map(l => ACTIVITY_COLORS[l] || '#3a3a5c');
+  _chartDirty = true;
+
+  // Process table — update state only, defer DOM repaint
+  if(!procs[pid]) procs[pid] = {name: ev.name || pid, category: cat, gpu: 0, count: 0, alerts: 0, first_seen: Date.now(), last_seen: Date.now()};
+  procs[pid].gpu = ev.gpu_ms || 0;
+  procs[pid].count++;
+  procs[pid].category = cat;
+  procs[pid].last_seen = Date.now();
+  if(ev.score === -1) procs[pid].alerts++;
+
+  // Defer all DOM repaints to next animation frame — max 60fps regardless of event rate
+  scheduleRender();
+}
+
+function renderProcTable(){
+  // Stable sort: oldest processes first, so the list doesn't jump around on every tick
+  const rows = Object.entries(procs)
+    .sort((a,b) => a[1].first_seen - b[1].first_seen)
+    .slice(0, 50); // allow scrolling through up to 50 active processes
+  
+  document.getElementById('procTableBody').innerHTML = rows.map(([pid, p]) => {
+    const ratio = p.count ? p.alerts / p.count : 0;
+    let badge, status;
+    if(ratio > 0.3){ badge='badge-anomaly'; status='ANOMALY'; }
+    else if(p.alerts === 0){ badge='badge-safe'; status='SAFE'; }
+    else { badge='badge-pending'; status='MIXED'; }
+    
+    const name = (p.name || '').split('\\').pop().slice(0, 22);
+    
+    let wlBtn = '';
+    let actBtns = '';
+    if (currentUser.role === 'admin') {
+      // Whitelist button and Action buttons are always visible for admins
+      wlBtn = `<button class="wl-btn" title="Direct Whitelist" onclick="directWhitelist('${p.name}', '${p.category}')">🛡</button>`;
+      actBtns = `
+        <button class="wl-btn" style="color:var(--red)" title="Kill" onclick="adminAction('kill', '${pid}', '${p.name}')">🗡</button>
+        <button class="wl-btn" style="color:var(--yellow)" title="Suspend" onclick="adminAction('suspend', '${pid}', '${p.name}')">⏸</button>
+        <button class="wl-btn" style="color:var(--dim)" title="Leave" onclick="adminAction('leave', '${pid}', '${p.name}')">→</button>
+      `;
+    } else if (currentUser.role !== 'admin') {
+      // Users and Guests only get the Request Whitelist lifeline
+      actBtns = `<button class="wl-btn" style="color:var(--purple);font-size:11px;" title="Request Whitelist" onclick="requestWhitelist('${pid}', '${p.name}')">🛡 Request WL</button>`;
+    }
+    
+    return `<tr>
+      <td style="color:var(--dim);font-family:monospace;font-size:11px">${pid.slice(-5)}</td>
+      <td style="max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${p.name}">${name}</td>
+      <td style="color:var(--dim);font-size:11px">${(p.category||'').replace('Activity','').trim()}</td>
+      <td style="font-family:monospace;font-size:11px">${(p.gpu||0).toFixed(2)}</td>
+      <td><span class="badge ${badge}">${status} ${wlBtn}</span></td>
+      <td style="white-space:nowrap">${actBtns}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function directWhitelist(processName, category) {
+  if(!confirm(`Whitelist ${processName} globally?`)) return;
+  const r = await fetch('/whitelist/direct', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({process_name: processName, category: category})
+  });
+  const data = await r.json();
+  showToast(r.ok ? `✓ ${processName} whitelisted` : `✗ Failed: ${data.detail || 'Error'}`);
+  if(r.ok) {
+    // Optimistically mark safe in current view
+    for (const pid in procs) {
+      if (procs[pid].name === processName) procs[pid].alerts = 0;
+    }
+    renderProcTable();
+  }
+}
+
+function updateInsight(){
+  const alertRatio = sessionAlerts / Math.max(sessionRows, 1);
+  const kbRatio = sessionKB / Math.max(sessionRows, 1);
+  let text;
+  if(sessionRows < 20){
+    text = 'Session starting. AI models warming up...';
+  } else if(alertRatio > 0.5 && kbRatio < 0.05){
+    text = `<strong>Heavy unfamiliar activity.</strong> ${sessionAlerts} anomalies across ${sessionRows} events. AI is actively learning your environment.`;
+  } else if(alertRatio < 0.05 && kbRatio > 0.4){
+    text = `<strong>Excellent session.</strong> ${Math.round(kbRatio*100)}% of activity recognized from learned signatures. Baseline is solid.`;
+  } else if(alertRatio > 0.1){
+    text = `<strong>${Math.round(alertRatio*100)}% anomaly rate.</strong> AI is observing new patterns. Accuracy improves with continued sessions.`;
+  } else {
+    text = '<strong>Normal session.</strong> System is stable. Monitoring quietly in the background.';
+  }
+  document.getElementById('insightText').innerHTML = text;
+}
+
+// ── OTP (admin) ──
+async function loadPendingOTPs(){
+  try {
+    const r = await fetch('/whitelist/pending');
+    if(!r.ok) return;
+    const data = await r.json();
+    const el = document.getElementById('otpList');
+    const el2 = document.getElementById('adminPendingRequests');
+    if(!data.length){
+      const empty = '<div style="color:var(--dim);font-size:12px;text-align:center;padding:16px">No pending requests.</div>';
+      el.innerHTML = empty;
+      if (el2) el2.innerHTML = empty;
+      return;
+    }
+    
+    // For Dashboard Sidebar
+    el.innerHTML = data.map(o => `
+      <div class="otp-item" id="side-otp-${esc(o.otp_code)}" style="flex-wrap: wrap;">
+        <div class="otp-info" style="flex-basis: 100%"><strong>${esc(o.process_name)}</strong> (PID ${esc(o.pid)})<br><span style="font-size:10px; color:var(--dim)">Requested by: <span style="color:#7289da">${esc(o.requested_by)}</span> on ${esc(o.machine_id)}</span></div>
+        <div style="display:flex; gap:6px; margin-top:8px;">
+          <button class="approve-btn" data-otp="${esc(o.otp_code)}" data-pid="${esc(o.pid)}" onclick="approveOTP(this.dataset.otp, this.dataset.pid)">Approve</button>
+          <button class="approve-btn" style="background:var(--red); color:#fff;" data-otp="${esc(o.otp_code)}" data-pid="${esc(o.pid)}" onclick="rejectOTP(this.dataset.otp)">Reject x Kill</button>
+          <button class="approve-btn" style="background:var(--surface2); border:1px solid var(--border); color:#fff;" data-otp="${esc(o.otp_code)}" data-pid="${esc(o.pid)}" onclick="rejectOTP(this.dataset.otp)">Reject x Ignore</button>
+        </div>
+      </div>`).join('');
+      
+    // For Admin Panel (Full controls)
+    if (el2) {
+      el2.innerHTML = data.map(o => `
+        <div class="otp-item" id="admin-otp-${o.otp_code}" style="flex-wrap: wrap;">
+          <div class="otp-info" style="flex-basis: 100%"><strong>${esc(o.process_name)}</strong> (PID ${esc(o.pid)})<br><span style="font-size:10px; color:var(--dim)">Requested by: <span style="color:#7289da">${o.requested_by}</span> on ${o.machine_id}</span></div>
+          <div style="display:flex; gap:6px; margin-top:8px;">
+            <button class="approve-btn" onclick="approveOTP('${o.otp_code}','${o.pid}')">✓ Whitelist</button>
+            <button class="approve-btn" style="background:var(--red); color:#fff;" onclick="rejectOTP('${o.otp_code}'); adminAction('kill', '${o.pid}', '${o.process_name}')">🗡 Reject x Kill</button>
+            <button class="approve-btn" style="background:var(--yellow); color:#fff;" onclick="rejectOTP('${o.otp_code}'); adminAction('suspend', '${o.pid}', '${o.process_name}')">⏸ Reject x Suspend</button>
+            <button class="approve-btn" style="background:var(--surface2); border:1px solid var(--border); color:#fff;" onclick="rejectOTP('${o.otp_code}'); adminAction('leave', '${o.pid}', '${o.process_name}')">→ Reject x Leave</button>
+          </div>
+        </div>`).join('');
+    }
+  } catch(e){}
+}
+
+async function approveOTP(code, pid) {
+  const adminRow = document.getElementById(`admin-otp-${code}`);
+  const sideRow = document.getElementById(`side-otp-${code}`);
+  if (adminRow) adminRow.remove();
+  if (sideRow) sideRow.remove();
+
+  const r = await fetch('/whitelist/approve', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({otp_code: code, pid: pid})
+  });
+  showToast(r.ok ? '✓ Whitelist approved!' : '✗ Failed to approve');
+  if(r.ok) loadAdminData();
+}
+
+async function rejectOTP(code) {
+  const adminRow = document.getElementById(`admin-otp-${code}`);
+  const sideRow = document.getElementById(`side-otp-${code}`);
+  if (adminRow) adminRow.remove();
+  if (sideRow) sideRow.remove();
+
+  await fetch(`/whitelist/pending/${code}`, { method:'DELETE' });
+}
+
+// ── User Whitelist Request ──
+async function requestWhitelist(pid, name) {
+  const r = await fetch('/whitelist/request', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({pid: pid, process_name: name})
+  });
+  showToast(r.ok ? `✓ Whitelist request sent to Admin` : `✗ Failed to request whitelist`);
+}
+
+async function adminAction(action, pid, name) {
+  const r = await fetch('/action', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({action: action, pid: pid, process_name: name})
+  });
+  
+  if (r.ok) {
+    showToast(`✓ ${action} command confirmed for ${name}`);
+    
+    // Page-Fault UI Pruning: Instantly wipe the process from local DOM and block ghost packets
+    if (action === 'kill' || action === 'suspend' || action === 'leave') {
+      deadPids.add(String(pid));
+      delete procs[String(pid)];
+      renderProcTable(); // Refresh table instantly without the dead row
+    }
+    
+    if (action === 'leave') {
+      await fetch('/ignored', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({pid: pid, process_name: name})
+      });
+    }
