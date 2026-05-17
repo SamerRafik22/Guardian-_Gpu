@@ -42,7 +42,6 @@ VAULT_MAX_ENTRIES       = 50_000  # hard cap on vault size
 KB_CANDIDATE_HITS       = 30      # hits before promoting to KB signature
 KB_CANDIDATE_AGE        = 60.0    # seconds before promoting to KB signature
 DB_WATCH_INTERVAL       = 2.0     # seconds between whitelist DB polls
-
 # =============================================================================
 # WHITELIST MANAGER — hot-reloadable, DB-backed, O(1) lookup
 # =============================================================================
@@ -122,8 +121,6 @@ class WhitelistManager:
 
     def stop(self):
         self._running = False
-
-
 # =============================================================================
 # NETWORK FEATURE GATE — per-process 3-phase activation
 # =============================================================================
@@ -181,8 +178,6 @@ class NetworkGate:
         blended[4] = net_tx * w
         blended[5] = net_rx * w
         return blended
-
-
 # =============================================================================
 # KNOWLEDGE BANK — Welford centroid + Mahalanobis distance
 # =============================================================================
@@ -450,8 +445,6 @@ class KnowledgeBank:
                 print(f"\n[KB] ✦ AUTO-LEARNED new pattern after {n} observations.")
         except Exception:
             pass
-
-
 # =============================================================================
 # RETRIEVAL BUFFER — cold storage reader for LOF
 # =============================================================================
@@ -532,8 +525,6 @@ class RetrievalBuffer:
             return result[:n]
         except Exception:
             return None
-
-
 # =============================================================================
 # BACKGROUND ANALYZER — Ghost Thread with LOF (Tier 4)
 # =============================================================================
@@ -594,8 +585,6 @@ class BackgroundAnalyzer(threading.Thread):
 
     def submit(self, data_row, iso_severity):
         self.queue.put((1, data_row, iso_severity))
-
-
 # =============================================================================
 # GUARDIAN VAULT — Compressed append-only storage (unknown-safe events only)
 # =============================================================================
@@ -661,8 +650,6 @@ class GuardianVault:
         except Exception:
             pass
         return False
-
-
 # =============================================================================
 # SLIDING WINDOW GATE — per-process sustained anomaly detector
 # =============================================================================
@@ -684,4 +671,300 @@ class SlidingWindowGate:
         self._windows[name].append(is_anomaly)
         count = sum(self._windows[name])
         return count >= SLIDE_WINDOW_THRESHOLD
+# =============================================================================
+# SUSTAINED COMPUTE GATE — Hard ceiling for continuous massive loads
+# =============================================================================
+class SustainedComputeGate:
+    """Tracks consecutive massive GPU loads. Triggers if a process cumulatively 
+    spends >= 8.0ms per 10ms tick for 70 consecutive ticks. Normal apps drop below
+    this threshold instantly and decay, so only miners/hashcrackers get caught."""
+    def __init__(self, threshold_ms=8.0, required_hits=70):
+        self.threshold     = threshold_ms
+        self.required_hits = required_hits
+        self.counters: dict[str, int] = {}
 
+    def push(self, name: str, time_ms: float) -> bool:
+        if name not in self.counters:
+            self.counters[name] = 0
+            
+        if time_ms >= self.threshold:
+            self.counters[name] += 1
+        else:
+            # Decay counter quickly if it drops to avoid false positives on stutter
+            self.counters[name] = max(0, self.counters[name] - 3)
+
+        return self.counters[name] >= self.required_hits
+
+
+# =============================================================================
+# GUARDIAN BRAIN — Main Orchestrator
+# =============================================================================
+class GuardianBrain:
+    def __init__(self):
+        self.feature_cols = ['GPU_TIME_MS', 'GPU_PACKET_COUNT',
+                             'PWR_W', 'MEM_MB', 'NET_TX', 'NET_RX']
+
+        # Unified Global Model
+        self.model:  IsolationForest  = None
+        self.scaler: StandardScaler   = None
+        self.is_trained = False
+
+        # Unified history buffer
+        self.history_buffer: list = []
+        self.max_history = 5000
+
+        # Counters
+        self.learn_counter = 0
+        self.save_counter  = 0
+
+        # Components
+        self.knowledge        = KnowledgeBank()
+        self.vault            = GuardianVault()
+        self.retrieval_buffer = RetrievalBuffer()
+        self.ghost            = BackgroundAnalyzer(self.knowledge, self.retrieval_buffer)
+        self.net_gate         = NetworkGate()
+        self.slide_gate       = SlidingWindowGate()
+        self.sustained_gate   = SustainedComputeGate()
+
+        # Per-process grace window counters {name: event_count}
+        self._grace_counters: dict[str, int] = {}
+
+        # Whitelist manager (hot-reload from DB)
+        db_path = os.path.join(_HERE, "guardian.db")
+        self.whitelist = WhitelistManager(db_path)
+
+        self.ghost.start()
+        self.load_state()
+        atexit.register(self.save_state)
+
+    # ── Persistence ───────────────────────────────────────────────────────────
+    def save_state(self):
+        try:
+            state = {
+                'buffer':     self.history_buffer,
+                'scaler':     self.scaler,
+                'model':      self.model,
+                'is_trained': self.is_trained,
+                'grace':      self._grace_counters,
+            }
+            joblib.dump(state, MODEL_PATH, compress=3)
+            self.knowledge.save()
+            print(f"[Brain] State Saved: {len(self.history_buffer)} events, "
+                  f"{len(self.knowledge.known_signatures)} KB sigs.")
+        except Exception as e:
+            print(f"[Brain] Save Failed: {e}")
+
+    def load_state(self):
+        if not os.path.exists(MODEL_PATH):
+            return
+        try:
+            print("[Brain] Resurrecting from previous life...")
+            state = joblib.load(MODEL_PATH)
+            self.history_buffer   = state.get('buffer', [])
+            self._grace_counters  = state.get('grace', {})
+
+            # Load pre-trained model directly
+            saved_model  = state.get('model')
+            saved_scaler = state.get('scaler')
+
+            if saved_model is not None and saved_scaler is not None:
+                self.model      = saved_model
+                self.scaler     = saved_scaler
+                self.is_trained = state.get('is_trained', False)
+                print(f"[Brain] Resurrection Complete. "
+                      f"Model loaded directly. Memories: {len(self.history_buffer)}")
+            else:
+                self.retrain_dynamic()
+                self.is_trained = True
+        except Exception as e:
+            print(f"[Brain] Resurrection Failed: {e}")
+
+    # ── Training ──────────────────────────────────────────────────────────────
+    def train_initial(self, log_dir_or_file):
+        # Skip if we already loaded trained models from state
+        if self.is_trained and self.model:
+            print("[Brain] Model already loaded from saved state — skipping CSV retrain.")
+            return
+
+        df_all = None
+        if os.path.isdir(log_dir_or_file):
+            files = glob.glob(os.path.join(log_dir_or_file, "gpu_log_*.csv"))
+            if not files:
+                print("[Brain] No data found. Starting fresh.")
+                self.is_trained = True
+                return
+            df_list = []
+            for f in files[-5:]:
+                try:
+                    df = pd.read_csv(f)
+                    for col in self.feature_cols:
+                        if col not in df.columns:
+                            df[col] = 0.0
+                    df_list.append(df)
+                except:
+                    pass
+            if not df_list:
+                return
+            df_all = pd.concat(df_list).fillna(0)
+        else:
+            if not os.path.exists(log_dir_or_file):
+                return
+            df_all = pd.read_csv(log_dir_or_file).fillna(0)
+            for col in self.feature_cols:
+                if col not in df_all.columns:
+                    df_all[col] = 0.0
+
+        print(f"[Brain] Training on {len(df_all)} historic events...")
+        for _, row in df_all.iterrows():
+            data = row.to_dict()
+            vec  = [data.get(c, 0.0) for c in self.feature_cols]
+            self.history_buffer.append(vec)
+
+        self.history_buffer = self.history_buffer[-self.max_history:]
+
+        self.retrain_dynamic()
+        self.is_trained = True
+        print("[Brain] Global Model Trained. Dynamic Learning Active.")
+
+    def retrain_dynamic(self):
+        if len(self.history_buffer) < 50:
+            return
+        try:
+            X = np.array(self.history_buffer)
+            if self.scaler is None:
+                self.scaler = StandardScaler()
+                self.model  = IsolationForest(
+                    n_estimators=100,
+                    contamination='auto',
+                    random_state=42
+                )
+            self.scaler.fit(X)
+            self.model.fit(self.scaler.transform(X))
+            # Update Mahalanobis covariance in KB
+            self.knowledge.update_covariance(X)
+        except:
+            pass
+
+    # ── Main prediction cascade ───────────────────────────────────────────────
+    def predict_hybrid(self, row: list, process_name: str = ""):
+        """6-Tier Hybrid Cascade.
+
+        Returns (score, severity, labels)
+          score   : 1 = safe, -1 = anomaly, 0 = uncertain
+          severity: IsoForest score_samples() value (0 to -1)
+          labels  : list of matched label strings or special flags
+        """
+        known_labels = []
+
+        # ── Tier 0a: System Whitelist (fastest, first) ────────────────────────
+        if process_name and self.whitelist.is_system(process_name):
+            return 1, 0.0, ["System Whitelisted"]
+
+        # ── Tier 0b: Admin Whitelist ──────────────────────────────────────────
+        if process_name and self.whitelist.is_admin(process_name):
+            return 1, 0.0, ["Admin Whitelisted"]
+
+        # ── Network Feature Gate: blend NET_TX/RX by activation phase ────────
+        effective_row = self.net_gate.apply(process_name, row) if process_name else row
+
+        # ── Periodic counters (always tick, regardless of verdict) ────────────
+        self.learn_counter += 1
+        if self.learn_counter >= RETRAIN_INTERVAL:
+            self.retrain_dynamic()
+            self.learn_counter = 0
+
+        self.save_counter += 1
+        if self.save_counter >= SAVE_INTERVAL:
+            self.save_state()
+            self.save_counter = 0
+
+        # ── Tier 1c: Sustained Compute Trap ──────────────────────────────────
+        time_ms = float(effective_row[0])
+        is_sustained = self.sustained_gate.push(process_name, time_ms)
+        if process_name and is_sustained:
+            return -1, -1.0, ["SUSTAINED_COMPUTE_TRAP"]
+
+        # ── Tier 1b: Per-process Grace Window ────────────────────────────────
+        grace_count = self._grace_counters.get(process_name, 0) + 1
+        self._grace_counters[process_name] = grace_count
+        if process_name and grace_count <= GRACE_WINDOW:
+            # During grace: collect into buffer (we're learning, not detecting)
+            self._safe_buffer_append(effective_row)
+            return 0, 0.0, ["GRACE_WINDOW"]
+
+        # ── Tier 2: Knowledge Bank ────────────────────────────────────────────
+        confidence, label = self.knowledge.is_known(
+            effective_row, name_override=process_name
+        )
+        if label:
+            known_labels = [label]
+
+        if confidence == KnowledgeBank.DEFINITE_SAFE:
+            self.knowledge.observe(effective_row)
+            self._safe_buffer_append(effective_row)  # ← safe confirmed
+            return 1, 0.5, known_labels
+
+        # ── Tier 3: IsolationForest — score_samples(), fixed threshold ────────
+        if not self.is_trained or self.model is None:
+            # No model yet — collect into buffer optimistically
+            self._safe_buffer_append(effective_row)
+            return 0, 0.0, known_labels
+
+        model  = self.model
+        scaler = self.scaler
+
+        try:
+            X        = np.array([effective_row])
+            X_scaled = scaler.transform(X)
+            severity = float(model.score_samples(X_scaled)[0])  # ← score_samples, NOT predict
+            is_anomaly = severity < ANOMALY_SCORE_THRESHOLD
+
+            if not is_anomaly:
+                # ── SAFE: only now add to training buffer ─────────────────────
+                self._safe_buffer_append(effective_row)
+                if confidence == KnowledgeBank.PROBABLE_SAFE:
+                    self.knowledge.observe(effective_row)
+                else:
+                    self.knowledge.auto_candidate(effective_row)
+            # If anomalous: do NOT add to buffer — don't train on threats
+
+            # ── Tier 3b: Ambiguity → Ghost/LOF ───────────────────────────────
+            if -0.7 < severity < -0.4:
+                if confidence == KnowledgeBank.PROBABLE_SAFE:
+                    self.knowledge.observe(effective_row)
+                    self._safe_buffer_append(effective_row)
+                    return 1, severity, known_labels
+                is_historic = self.vault.audit(effective_row, tolerance=2.0)
+                if is_historic:
+                    self.knowledge.auto_candidate(effective_row)
+                    self._safe_buffer_append(effective_row)
+                    return 1, 0.5, known_labels
+                else:
+                    self.ghost.submit(effective_row, severity)
+
+            # ── Tier 4: Sliding Window Gate ───────────────────────────────────
+            should_alert = self.slide_gate.push(process_name, is_anomaly)
+
+            if is_anomaly and not should_alert:
+                return 0, severity, known_labels
+
+            if is_anomaly:
+                known_labels = known_labels or ["ANOMALY"]
+
+            score = -1 if (is_anomaly and should_alert) else 1
+            return score, severity, known_labels
+
+        except Exception:
+            return 0, 0, known_labels
+
+    def _safe_buffer_append(self, vec: list):
+        """Add a CONFIRMED-SAFE event vector to the history buffer.
+        Overflow flushes oldest 500 entries to Vault for LOF neighbourhood.
+        This is the ONLY place history_buffers should be written to.
+        Anomalous events are never added here.
+        """
+        self.history_buffer.append(vec)
+        if len(self.history_buffer) > self.max_history:
+            overflow = self.history_buffer[:500]
+            self.vault.flush(overflow)
+            self.history_buffer = self.history_buffer[500:]
