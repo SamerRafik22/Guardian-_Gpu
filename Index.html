@@ -625,3 +625,213 @@ async function adminAction(action, pid, name) {
         body: JSON.stringify({pid: pid, process_name: name})
       });
     }
+    setTimeout(loadAdminData, 500);
+  } else {
+    showToast(`✗ Failed to execute ${action}`);
+  }
+}
+
+async function loadAdminData() {
+  loadPendingOTPs();
+  try {
+    const rIg = await fetch('/ignored');
+    if (rIg.ok) {
+      const igData = await rIg.json();
+      const igEl = document.getElementById('adminIgnoredList');
+      if (!igData.length) igEl.innerHTML = '<div style="color:var(--dim);font-size:12px;text-align:center;padding:16px">No ignored processes.</div>';
+      else igEl.innerHTML = igData.map(o => `
+        <div class="otp-item" style="display:flex; justify-content:space-between; align-items:center;">
+          <div class="otp-info"><strong>${esc(o.process_name)}</strong> (PID ${esc(o.pid)})<br><span style="font-size:10px; color:var(--dim)">Ignored At: ${new Date(o.ignored_at).toLocaleString()}</span></div>
+          <div style="display:flex; gap:4px;">
+            <button class="wl-btn" style="color:var(--green)" title="Direct Whitelist" onclick="directWhitelist('${o.process_name}', 'Unknown')">🛡</button>
+            <button class="wl-btn" style="color:var(--yellow)" title="Suspend" onclick="adminAction('suspend', '${o.pid}', '${o.process_name}')">⏸</button>
+            <button class="wl-btn" style="color:var(--red)" title="Kill" onclick="adminAction('kill', '${o.pid}', '${o.process_name}')">🗡</button>
+            <button class="wl-btn" style="color:#ff4757; opacity: 1; border: 1px solid var(--border); padding: 2px 6px; border-radius: 4px; margin-left: 8px;" title="Permanently Delete Record" onclick="deleteIgnored(${o.id})">✖</button>
+          </div>
+        </div>`).join('');
+    }
+    
+    const rUsr = await fetch('/users');
+    if (rUsr.ok) {
+      const usrData = await rUsr.json();
+      document.getElementById('adminUsersList').innerHTML = usrData.map((u, index) => {
+        let act = '';
+        if (currentUser.username === 'semsem400' && u.username !== 'semsem400') {
+            act = `<button class="logout-btn" style="padding:4px 8px;font-size:11px;color:var(--red);border-color:var(--red);" onclick="deleteUser(${u.id}, '${u.username}')">Delete</button>`;
+        }
+        if (u.role === 'pending_admin' && currentUser.username === 'semsem400') {
+            act = `<button class="approve-btn" onclick="approveRootAdmin(${u.id})">Approve Admin</button> ` + act;
+        }
+        let b = u.role === 'admin' ? 'badge-safe' : (u.role === 'user' ? 'badge-anomaly' : 'badge-pending');
+        return `
+        <tr>
+          <td>${index + 1}</td>
+          <td><strong>${u.username}</strong><br><span style="font-size:10px;color:var(--dim)">${u.email}</span></td>
+          <td><span class="badge ${b}">${u.role.toUpperCase()}</span></td>
+          <td style="color:var(--dim)">${new Date(u.created_at).toLocaleDateString()}</td>
+          <td>${act}</td>
+        </tr>
+      `}).join('');
+    }
+
+    const rWl = await fetch('/whitelist');
+    if (rWl.ok) {
+      const wlData = await rWl.json();
+      const elWl = document.getElementById('adminWhitelistTable');
+      if (!wlData.length) {
+          elWl.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--dim);">No whitelisted processes.</td></tr>';
+      } else {
+          // Fetch physical OS status
+          const names = wlData.map(w => w.exe_path || w.process_name);
+          let activeSet = new Set();
+          try {
+              const rStatus = await fetch('/processes/status', {
+                  method: 'POST', headers: {'Content-Type': 'application/json'},
+                  body: JSON.stringify({names: names})
+              });
+              if(rStatus.ok) {
+                  const sData = await rStatus.json();
+                  activeSet = new Set(sData.active || []);
+              }
+          } catch(e) {}
+          
+          elWl.innerHTML = wlData.map(w => {
+            const checkName = (w.exe_path || w.process_name).split('\\').pop().split('/').pop().toLowerCase();
+            const isRunning = activeSet.has(checkName);
+            const statusBadge = isRunning 
+              ? '<span class="badge badge-safe">ONLINE</span>' 
+              : '<span class="badge" style="background:#3a3a5c;color:#fff;">OFFLINE</span>';
+            const pathDisp = w.exe_path ? `<br><span style="font-size:10px;color:var(--dim);word-break:break-all;">Path: ${w.exe_path}</span>` : '';
+            return `
+            <tr>
+              <td><strong>${esc(w.process_name)}</strong>${pathDisp}</td>
+              <td>${statusBadge}</td>
+              <td>${w.approver_name || 'System'}</td>
+              <td style="color:var(--dim)">${new Date(w.approved_at).toLocaleDateString()}</td>
+              <td><button class="logout-btn" style="padding:4px 8px;font-size:11px;" onclick="revokeWhitelist(${w.id})">Revoke</button></td>
+            </tr>`;
+          }).join('');
+      }
+    }
+  } catch(e) {}
+}
+
+async function revokeWhitelist(id) {
+  if(!confirm('Are you sure you want to revoke this whitelist?')) return;
+  const r = await fetch(`/whitelist/${id}`, { method:'DELETE' });
+  showToast(r.ok ? '✓ Whitelist revoked' : '✗ Failed to revoke');
+  if(r.ok) loadAdminData();
+}
+
+async function deleteIgnored(id) {
+  if(!confirm('Permanently remove this exception? The process will be flagged normally again.')) return;
+  const r = await fetch(`/ignored/${id}`, { method:'DELETE' });
+  showToast(r.ok ? '✓ Ignored record permanently flushed' : '✗ Failed to flush');
+  if(r.ok) loadAdminData();
+}
+
+async function approveRootAdmin(id) {
+  if(!confirm('Grant this user full system administration access?')) return;
+  const r = await fetch(`/users/${id}/approve`, { method:'POST' });
+  showToast(r.ok ? '✓ Administrator approved' : '✗ Unauthorized');
+  if(r.ok) loadAdminData();
+}
+
+async function deleteUser(id, username) {
+  if(!confirm(`Are you sure you want to permanently delete the user '${username}'?`)) return;
+  const r = await fetch(`/users/${id}`, { method:'DELETE' });
+  showToast(r.ok ? `✓ User '${username}' deleted` : '✗ Failed to delete user');
+  if(r.ok) loadAdminData();
+}
+
+// ── Session history ──
+async function loadSessions(){
+  try {
+    const r = await fetch('/sessions');
+    const data = await r.json();
+    const el = document.getElementById('sessionHistory');
+    if(!data || !data.length){ el.innerHTML = '<tr><td colspan="5" style="text-align:center">No past sessions recorded yet.</td></tr>'; return; }
+    el.innerHTML = data.map(s => `
+      <tr class="clickable-row" onclick="window.open('/session/${s.id}', '_blank')">
+        <td style="color:var(--dim);font-size:11px">${s.machine_id ? s.machine_id.split('-')[0] : 'Unknown'}</td>
+        <td><strong>${new Date(s.start_time).toLocaleString()}</strong></td>
+        <td>${s.total_rows||0}</td>
+        <td style="color:${(s.total_alerts||0)>0?'var(--red)':'inherit'}">${s.total_alerts||0}</td>
+        <td><span style="color:${(s.health_score||0)>80?'var(--green)':'var(--red)'}">${Math.round(s.health_score||0)}%</span></td>
+      </tr>`).join('');
+  } catch(e){ document.getElementById('sessionHistory').innerHTML = '<tr><td colspan="5" style="text-align:center">Failed to load sessions.</td></tr>'; }
+}
+
+// ── Toast ──
+function showToast(msg){
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+// ── Boot ──
+async function boot() {
+  await checkAuth();
+  if (currentUser.role !== 'guest') {
+    try {
+      const r = await fetch('/dashboard/state');
+      if (r.ok) {
+          const state = await r.json();
+          procs = state.procs || {};
+          activityCounts = state.activityCounts || {};
+          
+          scoreLabels = state.scoreLabels || [];
+          scoreData = state.scoreData || [];
+          scoreChart.data.labels = scoreLabels;
+          scoreChart.data.datasets[0].data = scoreData;
+          scoreChart.update('none');
+          
+          const labels = Object.keys(activityCounts);
+          if (labels.length > 0) {
+              activityChart.data.labels = labels.map(l => `${l} (${activityCounts[l]})`);
+              activityChart.data.datasets[0].data = labels.map(l => activityCounts[l]);
+              activityChart.data.datasets[0].backgroundColor = labels.map(l => ACTIVITY_COLORS[l] || '#3a3a5c');
+              activityChart.update('none');
+          }
+          
+          let h = state.health || 100;
+          document.getElementById('healthDot').style.background = h > 80 ? '#1db954' : h > 55 ? '#ffd166' : '#ff4757';
+          document.getElementById('healthPct').textContent = `${Math.round(h)}%`;
+          
+          if (state.row_count !== undefined) {
+              sessionRows = state.row_count;
+              const el = document.getElementById('statRows');
+              if (el) el.textContent = sessionRows.toLocaleString();
+          }
+          if (state.alert_count !== undefined) {
+              sessionAlerts = state.alert_count;
+              const el = document.getElementById('statAlerts');
+              if (el) el.textContent = sessionAlerts.toLocaleString();
+          }
+          
+          renderProcTable();
+      }
+    } catch(e) {}
+  }
+  
+  // Garbage collect dead processes that stop sending metrics (manually closed games)
+  setInterval(() => {
+    const now = Date.now();
+    let changed = false;
+    for (const pid in procs) {
+      if (now - procs[pid].last_seen > 15000) {
+        delete procs[pid];
+        changed = true;
+      }
+    }
+    if (changed) renderProcTable();
+  }, 5000);
+  
+  connectWS();
+  setInterval(() => { if(currentUser.role === 'admin') loadPendingOTPs(); }, 15000);
+}
+
+boot();
+</script>
+</body>
+</html>
