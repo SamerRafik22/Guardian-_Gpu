@@ -521,3 +521,110 @@ async def save_session(payload: SessionPayload, _=Depends(auth.require_local_api
         user_id=None
     )
     return {"ok": True}
+@app.get("/sessions")
+async def get_sessions(user=Depends(auth.get_current_user)):
+    if user and user.get("role") == "admin":
+        return await db.get_session_history(machine_id=None, limit=50)
+    return await db.get_session_history(machine_id=MACHINE_ID, limit=20)
+
+@app.get("/api/machines")
+async def get_machines(user=Depends(auth.get_current_user)):
+    db_machines = await db.get_all_machines()
+    offline = [m for m in db_machines if m != MACHINE_ID]
+    return {"active": [{"id": MACHINE_ID, "status": "ONLINE"}], 
+            "offline": [{"id": m, "status": "OFFLINE"} for m in offline]}
+
+@app.get("/api/sessions/{session_id}")
+async def get_session_data(session_id: int, user=Depends(auth.get_current_user)):
+    data = await db.get_session_by_id(session_id)
+    if not data:
+        raise HTTPException(404, "Session not found")
+    return data
+
+@app.get("/session/{session_id}", response_class=HTMLResponse)
+async def view_session_page(session_id: int):
+    return _read_web_file("session.html")
+
+@app.get("/sessions/current")
+async def get_current_session(user=Depends(auth.get_current_user)):
+    return {**session_stats, "machine_id": MACHINE_ID}
+
+
+# ── WebSocket Live Stream ─────────────────────────────────────────────────────
+@app.websocket("/ws/stream")
+async def ws_stream(ws: WebSocket):
+    # Security: Require valid admin token before opening the stream
+    token = ws.cookies.get("guardian_token")
+    if not token or not await db.get_session_by_token(token):
+        await ws.close(code=1008)
+        return
+    await ws.accept()
+    with _client_lock:
+        connected_clients.append(ws)
+    ping_counter = 0
+    try:
+        while True:
+            # Batch-drain up to 50 queued events and send as one JSON array frame
+            batch = []
+            for _ in range(50):
+                try:
+                    batch.append(event_queue.get_nowait())
+                except queue.Empty:
+                    break
+
+            if batch:
+                # One WS send for all events — eliminates per-event overhead
+                await ws.send_text('[' + ','.join(batch) + ']')
+                ping_counter = 0
+            else:
+                await asyncio.sleep(0.05)  # 50ms idle poll
+                ping_counter += 1
+                # Ping every ~3 seconds (60 × 50ms) to keep connection alive
+                if ping_counter >= 60:
+                    ping_counter = 0
+                    try:
+                        await ws.send_text('[{"type":"ping"}]')
+                    except Exception:
+                        break
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        with _client_lock:
+            if ws in connected_clients:
+                connected_clients.remove(ws)
+
+
+# ── Serve Dashboard HTML ──────────────────────────────────────────────────────
+@app.get("/", response_class=HTMLResponse)
+async def dashboard(guardian_token: str = Cookie(default=None)):
+    if not await db.has_any_admin():
+        return RedirectResponse("/setup")
+    return _read_web_file("index.html")
+
+@app.get("/home", response_class=HTMLResponse)
+async def home_page():
+    return _read_web_file("home.html")
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page():
+    return _read_web_file("login.html")
+
+@app.get("/register", response_class=HTMLResponse)
+async def register_page():
+    return _read_web_file("register.html")
+
+
+# ── HTML Helper ───────────────────────────────────────────────────────────────
+def _read_web_file(name: str) -> str:
+    path = os.path.join(HERE, "guardian_web", name)
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    return f"<h1>File not found: {name}</h1>"
+
+
+# ── Entry Point ───────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    uvicorn.run("guardian_api:app", host="0.0.0.0", port=8080, reload=False)
