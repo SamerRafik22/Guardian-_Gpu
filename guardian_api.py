@@ -266,3 +266,165 @@ async def login(payload: LoginPayload, request: Request, background_tasks: Backg
     background_tasks.add_task(auth.send_auth_otp_email, user["email"], otp, "login")
     
     return {"ok": True, "status": "otp_required", "email": user["email"]}
+
+@app.post("/auth/verify-login")
+async def verify_login(payload: VerifyLoginPayload, request: Request):
+    user = await db.get_user_by_username(payload.username)
+    if not user:
+        raise HTTPException(401, "Invalid user")
+        
+    valid = await db.validate_auth_otp(user["email"], payload.otp_code, "login")
+    if not valid:
+        raise HTTPException(401, "Invalid or expired login code")
+        
+    token = auth.create_session_token()
+    expires = auth.make_expiry(days=7)
+    await db.create_web_session(user["id"], token, expires, ip=request.client.host)
+    resp = JSONResponse({"ok": True, "role": user["role"], "username": user["username"]})
+    resp.set_cookie("guardian_token", token, httponly=True, samesite="strict", max_age=60*60*24*7)
+    return resp
+
+@app.post("/auth/logout")
+async def logout(guardian_token: str = Cookie(default=None)):
+    if guardian_token:
+        await db.delete_session(guardian_token)
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie("guardian_token")
+    return resp
+
+@app.get("/auth/me")
+async def me(user=Depends(auth.get_current_user)):
+    if not user:
+        return {"role": "guest"}
+    return {"username": user["username"], "role": user["role"], "email": user.get("email")}
+
+@app.get("/users")
+async def get_users(user=Depends(auth.require_admin)):
+    async with db.aiosqlite.connect(db.DB_PATH) as conn:
+        conn.row_factory = db.aiosqlite.Row
+        async with conn.execute("SELECT id, username, email, role, machine_id, created_at FROM users") as c:
+            rows = await c.fetchall()
+            return [dict(r) for r in rows]
+
+@app.post("/users/{user_id}/approve")
+async def approve_new_admin(user_id: int, user=Depends(auth.require_admin)):
+    if user["username"].lower() != "semsem400":
+        raise HTTPException(403, "Only the root administrator (semsem400) can approve new admins.")
+    async with db.aiosqlite.connect(db.DB_PATH) as conn:
+        await conn.execute("UPDATE users SET role='admin' WHERE id=? AND role='pending_admin'", (user_id,))
+        await conn.commit()
+    return {"ok": True}
+
+@app.delete("/users/{user_id}")
+async def delete_user_endpoint(user_id: int, user=Depends(auth.require_admin)):
+    if user["username"].lower() != "semsem400":
+        raise HTTPException(403, "Only the root administrator (semsem400) can delete users.")
+    await db.delete_user(user_id)
+    return {"ok": True}
+
+
+# ── OTP Whitelist Routes ──────────────────────────────────────────────────────
+@app.post("/whitelist/request")
+async def request_whitelist(payload: OTPRequestPayload, request: Request, background_tasks: BackgroundTasks, user=Depends(auth.get_current_user)):
+    otp = auth.generate_otp()
+    expires = auth.make_otp_expiry(minutes=10)
+    machine_id = payload.machine_id or MACHINE_ID
+    requester_name = user["username"] if user else "Local System Pop-up"
+    
+    await db.create_otp_request(
+        payload.pid, payload.process_name, otp, expires,
+        machine_id=machine_id, exe_path=payload.exe_path,
+        requester=requester_name
+    )
+    
+    # Broadcast to admin dashboards instantly
+    push_event({
+        "type": "whitelist_requested",
+        "pid": payload.pid,
+        "name": payload.process_name,
+        "machine_id": machine_id,
+        "otp": otp,
+        "ts": time.time()
+    })
+
+    async with db.aiosqlite.connect(db.DB_PATH) as conn:
+        conn.row_factory = db.aiosqlite.Row
+        async with conn.execute("SELECT email FROM users WHERE role='admin' AND is_active=1") as c:
+            admins = await c.fetchall()
+            
+    for admin in admins:
+        background_tasks.add_task(auth.send_otp_email, admin["email"], otp, payload.process_name, payload.pid)
+        
+    return {"ok": True, "message": "OTP sent to admin"}
+
+@app.post("/whitelist/approve")
+async def approve_whitelist(payload: OTPApprovePayload, user=Depends(auth.require_admin)):
+    row = await db.validate_and_approve_otp(payload.otp_code, payload.pid, user["user_id"])
+    if not row:
+        raise HTTPException(400, "Invalid or expired OTP code")
+        
+    try:
+        action_queue.put_nowait({
+            "action": "approve_whitelist",
+            "pid": row["pid"],
+            "name": row["process_name"],
+            "exe_path": row.get("exe_path")
+        })
+    except queue.Full:
+        pass
+        
+    return {"ok": True, "process": row["process_name"], "pid": row["pid"]}
+
+@app.get("/whitelist/pending")
+async def get_pending(user=Depends(auth.require_admin)):
+    return await db.get_pending_otps()
+
+@app.delete("/whitelist/pending/{otp_code}")
+async def reject_whitelist(otp_code: str, user=Depends(auth.require_admin)):
+    async with db.aiosqlite.connect(db.DB_PATH) as conn:
+        await conn.execute("DELETE FROM otp_requests WHERE otp_code=?", (otp_code,))
+        await conn.commit()
+    return {"ok": True}
+
+@app.delete("/whitelist/pending-by-pid/{pid}")
+async def reject_whitelist_by_pid(pid: str, user=Depends(auth.require_admin)):
+    """Fallback: delete a pending OTP request by PID (used when otp_code onclick is broken)."""
+    async with db.aiosqlite.connect(db.DB_PATH) as conn:
+        await conn.execute("DELETE FROM otp_requests WHERE pid=?", (pid,))
+        await conn.commit()
+    return {"ok": True}
+
+@app.post("/whitelist/direct")
+async def direct_whitelist(payload: DirectWhitelistPayload, user=Depends(auth.require_admin)):
+    """Admin feature: instantly whitelist a process without OTP."""
+    await db.create_whitelist_log(payload.process_name, user["user_id"], payload.exe_path)
+    try:
+        action_queue.put_nowait({
+            "action": "add_whitelist",
+            "pid": "0",
+            "name": payload.process_name,
+            "exe_path": payload.exe_path,
+            "requested_by": user["username"]
+        })
+    except queue.Full:
+        pass
+    return {"ok": True, "message": f"{payload.process_name} whitelisted automatically."}
+
+@app.get("/whitelist")
+async def get_whitelist(user=Depends(auth.require_admin)):
+    return await db.get_whitelist_log()
+
+@app.delete("/whitelist/{log_id}")
+async def revoke_whitelist(log_id: int, user=Depends(auth.require_admin)):
+    name = await db.delete_whitelist_log(log_id)
+    if name:
+        try:
+            action_queue.put_nowait({
+                "action": "revoke_whitelist",
+                "pid": "0",
+                "name": name,
+                "requested_by": user["username"]
+            })
+        except queue.Full:
+            pass
+    return {"ok": True, "message": "Whitelist revoked."}
