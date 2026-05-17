@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Guardian — Sign In</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Inter', sans-serif; background: #1e1e2e; color: #e0e0f0;
+         min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .card { background: #252535; border-radius: 16px; padding: 40px; width: 360px;
+          border: 1px solid #3a3a5c; box-shadow: 0 20px 60px rgba(0,0,0,0.4); }
+  .logo { display: flex; align-items: center; gap: 10px; margin-bottom: 28px; }
+  .logo-icon { width: 40px; height: 40px; background: #00ff87; border-radius: 10px;
+               display: flex; align-items: center; justify-content: center; font-size: 20px; }
+  .logo-text { font-size: 22px; font-weight: 700; }
+  .subtitle { font-size: 13px; color: #888aaa; margin-top: 2px; }
+  label { display: block; font-size: 12px; color: #888aaa; margin-bottom: 6px; margin-top: 18px; }
+  input { width: 100%; padding: 10px 14px; background: #1e1e2e; border: 1px solid #3a3a5c;
+          border-radius: 8px; color: #e0e0f0; font-size: 14px; outline: none; transition: border 0.15s; }
+  input:focus { border-color: #7289da; }
+  .btn { width: 100%; padding: 11px; margin-top: 24px; border-radius: 8px; border: none;
+         background: #7289da; color: #fff; font-size: 14px; font-weight: 600; cursor: pointer; transition: opacity 0.15s; }
+  .btn:hover { opacity: 0.85; }
+  .err { color: #ff4757; font-size: 12px; margin-top: 10px; text-align: center; min-height: 18px; }
+  .footer-link { text-align: center; margin-top: 18px; font-size: 12px; color: #888aaa; }
+  .footer-link a { color: #7289da; text-decoration: none; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">
+    <div class="logo-icon">🛡</div>
+    <div><div class="logo-text">Guardian</div><div class="subtitle">Security Dashboard</div></div>
+  </div>
+  <div id="login-step">
+    <label for="username">Username</label>
+    <input type="text" id="username" placeholder="Enter username" autocomplete="username">
+    <label for="password">Password</label>
+    <input type="password" id="password" placeholder="Enter password" autocomplete="current-password">
+    <button class="btn" onclick="doLogin()">Sign In</button>
+  </div>
+
+  <div id="otp-step" style="display: none;">
+    <p class="subtitle" style="margin-bottom: 15px; text-align: center;">We sent a 6-digit code to your email.</p>
+    <label for="otp_code">Verification Code</label>
+    <input type="text" id="otp_code" placeholder="123456" maxlength="6" autocomplete="off" style="font-size: 20px; text-align: center; letter-spacing: 4px;">
+    <button class="btn" onclick="doVerify()">Verify Login</button>
+  </div>
+
+  <div class="err" id="err"></div>
+  <div class="footer-link">Don't have an account? <a href="/register">Register</a></div>
+</div>
+<script>
+async function doLogin(){
+  const username = document.getElementById('username').value.trim();
+  const password = document.getElementById('password').value;
+  if(!username || !password){ document.getElementById('err').textContent = 'Please fill in all fields.'; return; }
+  
+  const btn = document.querySelector('#login-step .btn');
+  btn.textContent = 'Authenticating...';
+  
+  const r = await fetch('/auth/login', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({username, password})
+  });
+  
+  const d = await r.json();
+  if(r.ok && d.status === 'otp_required'){ 
+      document.getElementById('login-step').style.display = 'none';
+      document.getElementById('otp-step').style.display = 'block';
+      document.getElementById('err').textContent = '';
+      window._loginUsername = username;
+  }
+  else if (r.ok) {
+      window.location = '/home'; 
+  }
+  else { 
+      document.getElementById('err').textContent = d.detail || 'Invalid username or password.'; 
+      btn.textContent = 'Sign In';
+  }
+}
+
+async function doVerify(){
+  const otp = document.getElementById('otp_code').value;
+  if(!otp){ document.getElementById('err').textContent = 'Please enter the code.'; return; }
+  
+  const btn = document.querySelector('#otp-step .btn');
+  btn.textContent = 'Verifying...';
+  
+  const r = await fetch('/auth/verify-login', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({username: window._loginUsername, otp_code: otp})
+  });
+  
+  if(r.ok){ 
+      window.location = '/home'; 
+  }
+  else { 
+      const d = await r.json();
+      document.getElementById('err').textContent = d.detail || 'Invalid verification code.'; 
+      btn.textContent = 'Verify Login';
+  }
+}
+
+document.addEventListener('keydown', e => { 
+    if(e.key==='Enter') {
+        if(document.getElementById('login-step').style.display !== 'none') doLogin();
+        else doVerify();
+    }
+});
+</script>
+</body>
+</html>
