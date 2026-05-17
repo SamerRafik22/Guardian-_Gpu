@@ -968,3 +968,324 @@ class GuardianBrain:
             overflow = self.history_buffer[:500]
             self.vault.flush(overflow)
             self.history_buffer = self.history_buffer[500:]
+# =============================================================================
+# CSV ARCHIVER — Session Data Pipeline (FIXED: uses 6 features)
+# =============================================================================
+VRAM_OVERFLOW = 17592186044415
+
+class CSVArchiver:
+    """Watches log directories. Archives completed CSVs to .npz.
+
+    Routes rows by type:
+      SUSPICIOUS_COPY → vault only (threat evidence)
+      Non-whitelisted, known safe → kb.observe()
+      Non-whitelisted, unknown safe → kb.auto_candidate()
+      All non-garbage → guardian_archive.npz
+
+    Whitelisted processes are SKIPPED entirely — no pollution of KB/Vault.
+    """
+    ARCHIVE_PATH = ARCHIVE_PATH
+
+    _COL_ALIASES = {
+        'GPU_TIME_MS':      ['GPU_TIME_MS', 'Duration_Mean_ns'],
+        'GPU_PACKET_COUNT': ['GPU_PACKET_COUNT', 'Kernels_Count'],
+        'PROCESS_NAME':     ['ProcessName', 'NAME', 'Name'],
+    }
+
+    def __init__(self, log_dirs, brain: 'GuardianBrain'):
+        self.log_dirs = [log_dirs] if isinstance(log_dirs, str) else list(log_dirs)
+        self.brain    = brain
+        self._done    = set()
+
+    def bootstrap(self):
+        print("[Archiver] Bootstrap scan starting...")
+        total = 0
+        for d in self.log_dirs:
+            total += self._archive_dir(d, leave_newest=False)
+        print(f"[Archiver] Bootstrap complete. {total} sessions archived.")
+
+    def scan_and_archive(self):
+        for d in self.log_dirs:
+            self._archive_dir(d, leave_newest=True)
+
+    def _archive_dir(self, log_dir, leave_newest):
+        if not os.path.isdir(log_dir):
+            return 0
+        files = sorted(glob.glob(os.path.join(log_dir, "gpu_log_*.csv")),
+                       key=os.path.getmtime)
+        if leave_newest and files:
+            files = files[:-1]
+        count = 0
+        for f in files:
+            if f not in self._done:
+                self._process_session(f)
+                count += 1
+        return count
+
+    def _resolve_col(self, df, key):
+        for alias in self._COL_ALIASES.get(key, [key]):
+            if alias in df.columns:
+                return alias
+        return None
+
+    def _process_session(self, csv_path):
+        fname = os.path.basename(csv_path)
+        try:
+            df = pd.read_csv(csv_path, on_bad_lines='skip')
+        except Exception as e:
+            print(f"[Archiver] Cannot read '{fname}': {e}")
+            self._done.add(csv_path)
+            return
+
+        if df.empty:
+            os.remove(csv_path)
+            self._done.add(csv_path)
+            return
+
+        col_time  = self._resolve_col(df, 'GPU_TIME_MS')
+        col_count = self._resolve_col(df, 'GPU_PACKET_COUNT')
+        col_name  = self._resolve_col(df, 'PROCESS_NAME')
+
+        if col_time is None or col_count is None:
+            self._done.add(csv_path)
+            return
+
+        # Ensure all 6 feature columns exist
+        feature_map = {
+            'GPU_TIME_MS':      col_time,
+            'GPU_PACKET_COUNT': col_count,
+            'PWR_W':            'PWR_W'   if 'PWR_W'   in df.columns else None,
+            'MEM_MB':           'MEM_MB'  if 'MEM_MB'  in df.columns else None,
+            'NET_TX':           'NET_TX'  if 'NET_TX'  in df.columns else None,
+            'NET_RX':           'NET_RX'  if 'NET_RX'  in df.columns else None,
+        }
+        # Fill missing feature cols with 0
+        for feat, col in feature_map.items():
+            if col is None:
+                df[feat] = 0.0
+
+        for col in [col_time, col_count]:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+
+        if 'VRAM_Used_MB' in df.columns:
+            df = df[df['VRAM_Used_MB'].astype(str) != str(VRAM_OVERFLOW)]
+        df = df[(df[col_time] != 0) | (df[col_count] != 0)].copy()
+
+        if df.empty:
+            os.remove(csv_path)
+            self._done.add(csv_path)
+            return
+
+        df['_activity'] = df.apply(
+            lambda r: classify_activity({
+                'GPU_TIME_MS': r[col_time], 'GPU_PACKET_COUNT': r[col_count]
+            }), axis=1
+        )
+
+        kb_obs, candidates, vault_rows = 0, 0, []
+        archive_t, archive_p, archive_a, archive_n = [], [], [], []
+
+        for _, row in df.iterrows():
+            # Build full 6-feature vector
+            vec = [
+                float(row.get(feature_map.get('GPU_TIME_MS') or col_time, 0)),
+                float(row.get(feature_map.get('GPU_PACKET_COUNT') or col_count, 0)),
+                float(row.get('PWR_W',  0)),
+                float(row.get('MEM_MB', 0)),
+                float(row.get('NET_TX', 0)),
+                float(row.get('NET_RX', 0)),
+            ]
+            activity = row['_activity']
+            name     = str(row[col_name]) if col_name and col_name in df.columns \
+                       else 'Unknown'
+
+            # Skip whitelisted processes — don't pollute KB/Vault
+            if self.brain.whitelist.is_system(name) or self.brain.whitelist.is_admin(name):
+                continue
+
+            if activity == 'SUSPICIOUS_COPY':
+                vault_rows.append(vec)
+            else:
+                conf, _ = self.brain.knowledge.is_known(vec)
+                if conf in (KnowledgeBank.DEFINITE_SAFE, KnowledgeBank.PROBABLE_SAFE):
+                    self.brain.knowledge.observe(vec)
+                    kb_obs += 1
+                else:
+                    self.brain.knowledge.auto_candidate(vec)
+                    candidates += 1
+
+            archive_t.append(vec[0])
+            archive_p.append(vec[1])
+            archive_a.append(activity)
+            archive_n.append(name)
+
+        if vault_rows:
+            self.brain.vault.flush(vault_rows)
+
+        if archive_t:
+            self._append_to_archive(
+                np.array(archive_t), np.array(archive_p),
+                np.array(archive_a), np.array(archive_n)
+            )
+
+        try:
+            os.remove(csv_path)
+        except Exception as e:
+            print(f"[Archiver] Could not delete '{fname}': {e}")
+
+        self._done.add(csv_path)
+        print(f"[Archiver] '{fname}' → {kb_obs} KB | {candidates} candidates | "
+              f"{len(vault_rows)} vault | {len(archive_t)} archived")
+
+    def _append_to_archive(self, times, packets, activities, names):
+        if os.path.exists(self.ARCHIVE_PATH):
+            try:
+                old    = np.load(self.ARCHIVE_PATH, allow_pickle=True)
+                times      = np.concatenate([old['time_ms'],      times])
+                packets    = np.concatenate([old['packet_count'], packets])
+                activities = np.concatenate([old['activity'],     activities])
+                names      = np.concatenate([old['process_name'], names])
+            except Exception:
+                pass
+        np.savez_compressed(self.ARCHIVE_PATH,
+                            time_ms=times, packet_count=packets,
+                            activity=activities, process_name=names)
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+def classify_activity(data):
+    time_ms = float(data.get('GPU_TIME_MS', 0))
+    count   = float(data.get('GPU_PACKET_COUNT', 0))
+
+    if count > 200 and time_ms < 1.0:
+        return "SUSPICIOUS_COPY"
+
+    # Pure GPU Compute: very long execution time + FEW dispatch calls
+    # (Hashcat, miners, ML training — not games which have hundreds of draw calls)
+    if time_ms > 500.0 and count < 50:
+        return "Compute"
+
+    # Heavy compute fallback (e.g. video encode, physics sim, miners — high time)
+    if time_ms > 100.0:
+        return "Compute"
+
+    # Gaming: many draw calls per frame (high count) + moderate execution time
+    if count > 100 and time_ms > 15.0:
+        return "Gaming"
+
+    if count > 50:
+        return "3D/UI Activity"
+
+    return "Idle"
+
+
+def parse_line(line):
+    try:
+        parts = line.strip().split(',')
+        if len(parts) < 7:
+            return None
+        if "TIMESTAMP" in parts[0]:
+            return None
+
+        has_net = (len(parts) >= 9)
+        obj = {}
+        obj['PID']  = parts[1]
+        obj['NAME'] = parts[2].replace('"', '')
+
+        if has_net:
+            obj['NET_RX']           = float(parts[-1])
+            obj['NET_TX']           = float(parts[-2])
+            obj['GPU_PACKET_COUNT'] = float(parts[-3])
+            obj['GPU_TIME_MS']      = float(parts[-4])
+            obj['PWR_W']            = float(parts[-5])
+            mem = float(parts[-6])
+            obj['MEM_MB'] = mem if mem < 100000 else 0.0
+        else:
+            obj['NET_RX']           = 0.0
+            obj['NET_TX']           = 0.0
+            obj['GPU_PACKET_COUNT'] = float(parts[-1]) if len(parts) >= 7 else 0.0
+            obj['GPU_TIME_MS']      = float(parts[-2]) if len(parts) >= 6 else 0.0
+            obj['PWR_W']            = float(parts[-3]) if len(parts) >= 5 else 3.0
+            mem = float(parts[-4]) if len(parts) >= 4 else 512.0
+            obj['MEM_MB'] = mem if mem < 100000 else 0.0
+
+        return obj
+    except Exception:
+        return None
+
+
+# =============================================================================
+# STANDALONE MAIN (used when running guardian_brain.py directly, not via live.py)
+# =============================================================================
+def main():
+    print("----------------------------------------------------------------")
+    print("   GUARDIAN BRAIN - Live Anomaly Detection System")
+    print("----------------------------------------------------------------")
+
+    brain    = GuardianBrain()
+    archiver = CSVArchiver([LOG_DIR, BUILD_RELEASE_DIR], brain)
+    archiver.bootstrap()
+    brain.train_initial(LOG_DIR)
+
+    streamer          = _LogStreamer(LOG_DIR)
+    last_archive_scan = time.time()
+    ARCHIVE_INTERVAL  = 60
+
+    print("[Streamer] Watching for live events...")
+    try:
+        while True:
+            lines = streamer.stream_lines()
+            for line in lines:
+                data = parse_line(line)
+                if data:
+                    category = classify_activity(data)
+                    vec      = [data[c] for c in brain.feature_cols]
+                    name     = data.get('NAME', 'Unknown')
+                    score, severity, aux = brain.predict_hybrid(
+                        vec, activity_class=category, process_name=name
+                    )
+
+                    if aux == "SUSPICIOUS_COPY_TRAP" or category == "SUSPICIOUS_COPY":
+                        score = -1
+
+                    if score == -1:
+                        print(f"\n!!! ANOMALY !!! [{severity:.4f}] "
+                              f"PID:{data['PID']} ({name}) {category}")
+
+            if time.time() - last_archive_scan >= ARCHIVE_INTERVAL:
+                archiver.scan_and_archive()
+                last_archive_scan = time.time()
+
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("\n[!] Stopped.")
+
+
+class _LogStreamer:
+    """Minimal log streamer for standalone brain main()."""
+    def __init__(self, log_dir):
+        self.log_dir     = log_dir
+        self.current     = None
+        self.file_handle = None
+
+    def _latest(self):
+        files = glob.glob(os.path.join(self.log_dir, "gpu_log_*.csv"))
+        return max(files, key=os.path.getmtime) if files else None
+
+    def stream_lines(self):
+        latest = self._latest()
+        if not latest:
+            return []
+        if latest != self.current:
+            if self.file_handle:
+                self.file_handle.close()
+            self.current     = latest
+            self.file_handle = open(self.current, 'r')
+            self.file_handle.seek(0, 2)
+        return self.file_handle.readlines()
+
+
+if __name__ == "__main__":
+    main()
