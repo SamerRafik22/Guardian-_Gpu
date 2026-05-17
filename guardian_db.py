@@ -73,3 +73,87 @@ CREATE TABLE IF NOT EXISTS auth_otps (
     status      TEXT    DEFAULT 'pending',
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS session_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    machine_id      TEXT    NOT NULL,
+    user_id         INTEGER REFERENCES users(id),
+    start_time      TIMESTAMP,
+    end_time        TIMESTAMP,
+    total_rows      INTEGER DEFAULT 0,
+    total_alerts    INTEGER DEFAULT 0,
+    kb_matches      INTEGER DEFAULT 0,
+    top_processes   TEXT,
+    conclusion_text TEXT,
+    health_score    REAL DEFAULT 100.0
+);
+
+CREATE TABLE IF NOT EXISTS whitelist_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    pid             TEXT    NOT NULL,
+    process_name    TEXT    NOT NULL,
+    exe_path        TEXT,
+    approved_by     INTEGER REFERENCES users(id),
+    otp_request_id  INTEGER REFERENCES otp_requests(id),
+    approved_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS ignored_processes (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    pid             TEXT    NOT NULL,
+    process_name    TEXT    NOT NULL,
+    machine_id      TEXT    NOT NULL,
+    ignored_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS system_whitelist (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    process_name    TEXT    NOT NULL UNIQUE,
+    added_by        INTEGER REFERENCES users(id),
+    added_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+
+# ── Init ──────────────────────────────────────────────────────────────────────
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executescript(SCHEMA)
+        # Migrations for existing DBs
+        try:
+            await db.execute("ALTER TABLE otp_requests ADD COLUMN exe_path TEXT")
+        except: pass
+        try:
+            await db.execute("ALTER TABLE whitelist_log ADD COLUMN exe_path TEXT")
+        except: pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN is_verified BOOLEAN DEFAULT 0")
+            await db.execute("UPDATE users SET is_verified = 1") # Auto-verify existing users
+        except: pass
+        await db.commit()
+        
+    # Security: Enforce strict NTFS permissions using Windows icacls
+    try:
+        import subprocess
+        subprocess.run(
+            f'icacls "{DB_PATH}" /inheritance:r /grant:r "NT AUTHORITY\\SYSTEM":(R,W) /grant:r "BUILTIN\\Administrators":(R,W)', 
+            shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        pass
+        
+    print(f"[DB] Initialized at {DB_PATH}")
+
+
+# ── User CRUD ─────────────────────────────────────────────────────────────────
+async def create_user(username, email, password_hash, role="user", machine_id=None, is_verified=0):
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                "INSERT INTO users (username, email, password_hash, role, machine_id, is_verified) VALUES (?,?,?,?,?,?)",
+                (username, email, password_hash, role, machine_id or MACHINE_ID, is_verified)
+            )
+            await db.commit()
+            return True
+        except aiosqlite.IntegrityError:
+            return False
