@@ -479,3 +479,127 @@ def main():
                 confidence, _        = brain.knowledge.is_known(
                     vec, name_override=name
                 )
+# Whitelist bypass already handled inside predict_hybrid (Tier 0a/0b).
+                
+                # Track stats
+                stats['activity'][category]     += 1
+                stats['procs'][name]['events']  += 1
+                stats['procs'][name]['gpu_sum'] += data['GPU_TIME_MS']
+                if confidence in (KnowledgeBank.DEFINITE_SAFE, KnowledgeBank.PROBABLE_SAFE):
+                    stats['kb_matches'] += 1
+
+                is_kb_match = confidence in (KnowledgeBank.DEFINITE_SAFE, KnowledgeBank.PROBABLE_SAFE)
+                tracker.update(pid, name, vec, category, score, severity, is_kb_match)
+
+                # Push to web dashboard if available
+                if _API_AVAILABLE:
+                    _api.push_event({
+                        "type": "verdict",
+                        "ts": time.time(),
+                        "pid": pid,
+                        "name": name,
+                        "category": category,
+                        "score": score,
+                        "severity": severity,
+                        "gpu_ms": data.get('GPU_TIME_MS', 0),
+                        "pwr_w": data.get('PWR_W', 0),
+                        "mem_mb": data.get('MEM_MB', 0),
+                        "kb_match": is_kb_match
+                    })
+
+                if score == -1:
+                    alert_count += 1
+                    stats['procs'][name]['alerts'] += 1
+                    # Fire popup for real anomalies (not every idle row)
+                    launch_alert_popup(data, vec, severity, category, brain)
+
+                print(f"  {pid:<8} "
+                      f"{name[:23]:<24} "
+                      f"{activity_icon(category):<16}  "
+                      f"{data.get('PWR_W',0):>6.1f}  "
+                      f"{data.get('MEM_MB',0):>7.0f}  "
+                      f"{data['GPU_TIME_MS']:>7.2f}  "
+                      f"{data['GPU_PACKET_COUNT']:>7.0f}  "
+                      f"{verdict_str(score, severity, confidence, category, aux)}")
+
+            # Live health bar
+            health    = max(0, 100 * (1 - alert_count / max(row_count, 1)))
+            bar       = "█" * int(health/5) + "░" * (20 - int(health/5))
+            col       = GRN if health > 80 else YEL if health > 60 else RED
+            print(f"\r  {DIM}Rows:{row_count:,} | Alerts:{alert_count} | "
+                  f"Health:{col}{health:.0f}%{RST} {col}[{bar}]{RST}  ",
+                  end="", flush=True)
+
+            # Sustained Attack Checks (Every 10 seconds)
+            if time.time() - last_sustained_check >= 10.0:
+                alerts_batch = sustained_detector.run(tracker)
+                if alerts_batch:
+                    for a in alerts_batch:
+                        alert_count += 1
+                        stats['procs'][a['name']]['alerts'] += 1
+                        dummy_data = {'PID': a['pid'], 'NAME': a['name'], 'GPU_TIME_MS': 0, 'GPU_PACKET_COUNT': 0}
+                        launch_alert_popup(dummy_data, [0]*6, a['severity'], a['type'], brain)
+                        print(f"\n{RED}*** {a['type']} ***{RST} {a['name']} (PID: {a['pid']}) → {a['msg']}")
+                tracker.cleanup_stale()
+                last_sustained_check = time.time()
+
+            # Process Admin Remote Actions
+            if _API_AVAILABLE:
+                import queue
+                while True:
+                    try:
+                        act = _api.action_queue.get_nowait()
+                        cmd = act["action"]
+                        tgt_pid = act["pid"]
+                        tgt_name = act["name"]
+                        if cmd == "kill":
+                            try:
+                                killed = windows_killer.force_kill_tree(int(tgt_pid), tgt_name)
+                                print(f"\n{RED}[Admin Action]{RST} Syscall Terminated {tgt_name} tree ({len(killed)} process(es)).")
+                            except Exception as e:
+                                print(f"\n{RED}[Admin Action]{RST} Syscall Kill failed for {tgt_name}: {e}")
+                        elif cmd == "suspend":
+                            try:
+                                import psutil
+                                psutil.Process(int(tgt_pid)).suspend()
+                                print(f"\n{YEL}[Admin Action]{RST} Suspended {tgt_name} (PID: {tgt_pid})")
+                            except: pass
+                        elif cmd == "leave":
+                            # 5 Minute cooldown
+                            with _popup_lock:
+                                _alerted_pids[tgt_name] = time.time()
+                            print(f"\n{DIM}[Action]{RST} Snoozing {tgt_name} for 5 minutes")
+                        elif cmd == "approve_whitelist":
+                            with _popup_lock:
+                                _alerted_pids[tgt_name] = time.time()
+                            exe_path = act.get("exe_path")
+                            cnt = whitelist_tree(tgt_name, exe_path, brain)
+                            print(f"\n{GRN}[Admin Action]{RST} Whitelist Approved for {tgt_name} (+ {cnt-1} children)")
+                        elif cmd == "add_whitelist":
+                            if tgt_name == "Unknown":
+                                print(f"\n{YEL}[Admin Action]{RST} Rejected Direct Whitelist: Cannot whitelist 'Unknown'.")
+                            else:
+                                exe_path = act.get("exe_path")
+                                cnt = whitelist_tree(tgt_name, exe_path, brain)
+                                print(f"\n{GRN}[Admin Action]{RST} Direct Whitelist Added for {tgt_name} (+ {cnt-1} children)")
+                        elif cmd == "revoke_whitelist":
+                            brain.knowledge.revoke_admin_whitelist(tgt_name)
+                            brain.whitelist.revoke_admin_live(tgt_name)
+                            with _popup_lock:
+                                _alerted_pids.pop(tgt_name, None)
+                                _popup_pending.discard(tgt_name)
+                            print(f"\n{YEL}[Admin Action]{RST} Whitelist Revoked for {tgt_name}. Rearming alerts.")
+
+                    except queue.Empty:
+                        break
+
+            # Adaptive sleep: no sleep when data is flowing, 50ms idle poll when quiet
+            if rows_this_cycle == 0:
+                time.sleep(0.05)
+
+    except KeyboardInterrupt:
+        print()
+        print_summary(stats, row_count, alert_count, start_time, brain)
+
+if __name__ == "__main__":
+    main()
