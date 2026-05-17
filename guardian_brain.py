@@ -261,3 +261,194 @@ class KnowledgeBank:
                 print(f"[KB] Loaded {added} admin whitelists from DB.")
         except Exception as e:
             print(f"[KB] DB whitelist load failed: {e}")
+        def add_admin_whitelist(self, name: str):
+        # Dedup: skip if already present as admin override
+        if any(s.get('_is_admin_override') and s.get('name') == name
+               for s in self.known_signatures):
+            return
+        self.known_signatures.append({
+            "label": "ADMIN_WHITELIST", "name": name,
+            "vector": [0.0] * 6, "radius": 9999.0,
+            "hit_count": 1, "_is_admin_override": True
+        })
+
+
+    def revoke_admin_whitelist(self, name: str):
+        self.known_signatures = [
+            s for s in self.known_signatures
+            if not (s.get('_is_admin_override') and s.get('name') == name)
+        ]
+
+    # ── Covariance update (called after IsoForest retrain) ───────────────────
+    def update_covariance(self, data: np.ndarray):
+        """Fit a covariance inverse for Mahalanobis distance in `is_known`."""
+        if data is None or len(data) < 10:
+            return
+        try:
+            n_features = data.shape[1]
+            cov = EmpiricalCovariance().fit(data)
+            self._cov_inv = cov.precision_  # = Σ⁻¹
+        except Exception:
+            pass
+
+    def _mahalanobis(self, x: np.ndarray, ref: np.ndarray) -> float:
+        """Mahalanobis distance; falls back to normalized Euclidean."""
+        prec = self._cov_inv
+        if prec is not None:
+            try:
+                diff = x - ref
+                dist = float(np.sqrt(diff @ prec @ diff))
+                return dist
+            except Exception:
+                pass
+        # Fallback: normalized Euclidean
+        raw_d  = np.linalg.norm(x - ref)
+        ref_mag = max(np.linalg.norm(ref), 1.0)
+        return raw_d / ref_mag
+
+    # ── Core lookup ───────────────────────────────────────────────────────────
+    def is_known(self, vector, name_override: str = None):
+        if name_override:
+            for sig in self.known_signatures:
+                if sig.get('_is_admin_override') and sig.get('name') == name_override:
+                    return self.DEFINITE_SAFE, "Admin Whitelisted"
+
+        if not self.known_signatures:
+            return self.UNKNOWN, None
+
+        try:
+            vec = np.array(vector, dtype=float)
+            best_dist   = float('inf')
+            best_radius = 1.0
+            best_label  = None
+
+            for sig in self.known_signatures:
+                ref    = np.array(sig['vector'], dtype=float)
+                ref_mag = max(np.linalg.norm(ref), 1.0)
+                dist   = self._mahalanobis(vec, ref)
+                radius = float(sig.get('radius', ref_mag * 0.10))
+                # Normalise radius to same Mahalanobis scale
+                radius_m = radius / ref_mag
+
+                if dist < best_dist:
+                    best_dist   = dist
+                    best_radius = radius_m
+                    best_label  = sig.get('label', sig.get('name', 'Known'))
+
+            if best_dist <= best_radius:
+                return self.DEFINITE_SAFE, best_label
+            elif best_dist <= best_radius * 2.0:
+                return self.PROBABLE_SAFE, best_label
+        except Exception:
+            pass
+
+        return self.UNKNOWN, None
+
+    # ── Online centroid update ────────────────────────────────────────────────
+    def observe(self, vector):
+        if not self.known_signatures:
+            return
+        try:
+            import math
+            vec = np.array(vector, dtype=float)
+            best_idx, best_norm = None, float('inf')
+            for i, sig in enumerate(self.known_signatures):
+                ref     = np.array(sig['vector'], dtype=float)
+                ref_mag = max(np.linalg.norm(ref), 1.0)
+                nd      = np.linalg.norm(vec - ref) / ref_mag
+                if nd < best_norm:
+                    best_norm = nd
+                    best_idx  = i
+
+            if best_idx is None:
+                return
+            sig     = self.known_signatures[best_idx]
+            ref     = np.array(sig['vector'], dtype=float)
+            ref_mag = max(np.linalg.norm(ref), 1.0)
+            radius_norm = float(sig.get('radius', ref_mag * 0.10)) / ref_mag
+
+            if best_norm > radius_norm * 2.0:
+                return
+
+            n = sig.get('hit_count', 0) + 1
+            sig['hit_count'] = n
+
+            old_c  = np.array(sig['vector'], dtype=float)
+            weight = 1.0 / (1.0 + math.log10(n)) if n > 0 else 1.0
+            new_c  = old_c + (vec - old_c) * weight
+            sig['vector'] = new_c.tolist()
+
+            # Drift alert
+            if '_seed_centroid' not in sig:
+                sig['_seed_centroid'] = old_c.tolist()
+            drift = float(np.linalg.norm(new_c - np.array(sig['_seed_centroid'])))
+            if drift > (ref_mag * 0.15):
+                print(f"\n[KB WARNING] '{sig.get('name','?')}' drifted >15%!")
+
+            # Welford variance of distances
+            dist     = float(np.linalg.norm(vec - new_c))
+            old_md   = sig.get('_mean_dist', 0.0)
+            old_m2   = sig.get('_m2_dist',   0.0)
+            new_md   = old_md + (dist - old_md) / n
+            new_m2   = old_m2 + (dist - old_md) * (dist - new_md)
+            sig['_mean_dist'] = new_md
+            sig['_m2_dist']   = new_m2
+
+            if n >= 5:
+                std_d       = float(np.sqrt(new_m2 / n))
+                seed_radius = float(sig.get('_seed_radius', sig.get('radius', ref_mag * 0.10)))
+                sig['_seed_radius'] = seed_radius
+                sig['radius'] = max(seed_radius, new_md + 2.0 * std_d)
+        except Exception:
+            pass
+
+    # ── Auto-candidate: promote unknown-but-safe patterns ─────────────────────
+    def auto_candidate(self, vector):
+        try:
+            vec = np.array(vector, dtype=float)
+            mag = max(np.linalg.norm(vec), 1.0)
+            bk  = tuple(np.round(vec / mag / self.CANDIDATE_BUCKET_SIZE).astype(int))
+
+            if bk not in self._candidates:
+                self._candidates[bk] = {
+                    'centroid': vec.tolist(), 'hits': 0,
+                    'm2': 0.0, 'mean_d': 0.0, 'first_seen': time.time()
+                }
+
+            c = self._candidates[bk]
+            c['hits'] += 1
+            n = c['hits']
+
+            old_c  = np.array(c['centroid'], dtype=float)
+            new_c  = old_c + (vec - old_c) / n
+            c['centroid'] = new_c.tolist()
+
+            dist   = float(np.linalg.norm(vec - new_c))
+            old_md = c['mean_d']
+            old_m2 = c['m2']
+            new_md = old_md + (dist - old_md) / n
+            new_m2 = old_m2 + (dist - old_md) * (dist - new_md)
+            c['mean_d'] = new_md
+            c['m2']     = new_m2
+
+            # ── Promote? (Anti-Burst gate: KB_CANDIDATE_HITS + KB_CANDIDATE_AGE) ──
+            age = time.time() - c.get('first_seen', time.time())
+            if c['hits'] >= self.CANDIDATE_PROMOTE_HITS and age > KB_CANDIDATE_AGE:
+                std_d  = float(np.sqrt(new_m2 / n)) if n > 1 else 0.0
+                radius = max(new_md + 2.0 * std_d, mag * 0.05)
+                self.known_signatures.append({
+                    'name':       f'Auto-Learned ({datetime.now().strftime("%H:%M")})',
+                    'vector':     new_c.tolist(),
+                    'radius':     radius,
+                    'hit_count':  n,
+                    '_mean_dist': new_md,
+                    '_m2_dist':   new_m2,
+                    'auto':       True,
+                })
+                del self._candidates[bk]
+                self.save()
+                print(f"\n[KB] ✦ AUTO-LEARNED new pattern after {n} observations.")
+        except Exception:
+            pass
+
+
