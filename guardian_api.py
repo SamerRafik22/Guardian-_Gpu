@@ -428,3 +428,96 @@ async def revoke_whitelist(log_id: int, user=Depends(auth.require_admin)):
         except queue.Full:
             pass
     return {"ok": True, "message": "Whitelist revoked."}
+
+# ── Remote Actions & Ignored Routes ───────────────────────────────────────────
+@app.post("/action")
+async def perform_action(payload: ActionPayload, user=Depends(auth.require_admin)):
+    """Admin dashboard sends kill, suspend, or leave commands here."""
+    
+    # ── Page-Fault Architecture: Immediate Local Execution ──
+    if payload.action == "kill":
+        result = guardian_actions.execute_kill(payload.pid, payload.process_name)
+        return {"ok": result["status"] == "success", "message": result["message"]}
+    elif payload.action == "suspend":
+        result = guardian_actions.execute_suspend(payload.pid, payload.process_name)
+        return {"ok": result["status"] == "success", "message": result["message"]}
+        
+    # Legacy Queue fallback for leave/whitelist
+    try:
+        action_queue.put_nowait({
+            "action": payload.action,
+            "pid": payload.pid,
+            "name": payload.process_name,
+            "requested_by": user["username"]
+        })
+        return {"ok": True, "message": f"{payload.action} command queued for {payload.process_name}"}
+    except queue.Full:
+        raise HTTPException(500, "Local PC action queue is full")
+
+@app.post("/ignored")
+async def add_ignored(payload: IgnoredPayload, request: Request):
+    if request.client.host not in ["127.0.0.1", "localhost", "::1"]:
+        raise HTTPException(status_code=403, detail="Remote submission denied")
+    # Public endpoint called by the popup when user clicks "Leave"
+    await db.log_ignored_process(payload.pid, payload.process_name)
+    try:
+        action_queue.put_nowait({
+            "action": "leave",
+            "pid": payload.pid,
+            "name": payload.process_name,
+            "requested_by": "User"
+        })
+    except queue.Full:
+        pass
+    return {"ok": True}
+
+@app.delete("/ignored/{log_id}")
+async def flush_ignored(log_id: int, user=Depends(auth.require_admin)):
+    await db.delete_ignored_process(log_id)
+    return {"ok": True}
+
+@app.post("/processes/status")
+async def check_process_status(payload: ProcessStatusPayload, user=Depends(auth.require_admin)):
+    import psutil
+    import os
+    active = set()
+    targets = set([os.path.basename(n.replace('\\', '/')).lower() for n in payload.names])
+    for p in psutil.process_iter(['name']):
+        if p.info['name'] and p.info['name'].lower() in targets:
+            active.add(p.info['name'].lower())
+    return {"active": list(active)}
+
+@app.get("/dashboard/state")
+async def get_dashboard_state(user=Depends(auth.require_login)):
+    return dashboard_state
+
+@app.get("/ignored")
+async def get_ignored(user=Depends(auth.require_admin)):
+    return await db.get_ignored_processes()
+
+@app.post("/api/shutdown")
+async def shutdown_system(request: Request, _=Depends(auth.require_local_api_key)):
+    if request.client.host not in ["127.0.0.1", "localhost", "::1"]:
+        raise HTTPException(status_code=403, detail="Remote shutdown denied")
+    """Triggered by Stop_Guardian.bat to gracefully close Python brain and save history."""
+    import _thread
+    _thread.interrupt_main()
+    return {"ok": True}
+
+
+# ── Session History Routes ─────────────────────────────────────────────────────
+@app.post("/sessions")
+async def save_session(payload: SessionPayload, _=Depends(auth.require_local_api_key)):
+    from datetime import datetime
+    await db.save_session_event(
+        start_time=datetime.fromtimestamp(payload.start_time),
+        end_time=datetime.fromtimestamp(payload.end_time),
+        total_rows=payload.total_rows,
+        total_alerts=payload.total_alerts,
+        kb_matches=payload.kb_matches,
+        top_processes=payload.top_processes,
+        conclusion_text=payload.conclusion_text,
+        health_score=payload.health_score,
+        user_id=None
+    )
+    return {"ok": True}
