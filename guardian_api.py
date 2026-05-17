@@ -146,3 +146,123 @@ def push_event(event: dict):
     except queue.Full:
         pass  # Dashboard is behind — drop, never block Brain
 
+# ── Pydantic Models ───────────────────────────────────────────────────────────
+class RegisterPayload(BaseModel):
+    username: str
+    email: str
+    password: str
+    role: str = "user"
+
+class LoginPayload(BaseModel):
+    username: str
+    password: str
+
+class VerifySignupPayload(BaseModel):
+    email: str
+    otp_code: str
+
+class VerifyLoginPayload(BaseModel):
+    username: str
+    otp_code: str
+
+class OTPRequestPayload(BaseModel):
+    pid: str
+    process_name: str
+    exe_path: Optional[str] = None
+    machine_id: Optional[str] = None
+
+class OTPApprovePayload(BaseModel):
+    otp_code: str
+    pid: str
+
+class DirectWhitelistPayload(BaseModel):
+    process_name: str
+    category: str
+    exe_path: Optional[str] = None
+
+class ActionPayload(BaseModel):
+    action: str
+    pid: str
+    process_name: str
+
+class IgnoredPayload(BaseModel):
+    pid: str
+    process_name: str
+
+class ProcessStatusPayload(BaseModel):
+    names: list[str]
+
+class SessionPayload(BaseModel):
+    start_time: float
+    end_time: float
+    total_rows: int
+    total_alerts: int
+    kb_matches: int
+    top_processes: list
+    health_score: float
+    conclusion_text: str = "Session Completed"
+
+# ── Auth Routes ───────────────────────────────────────────────────────────────
+@app.get("/setup", response_class=HTMLResponse)
+async def setup_page():
+    if await db.has_any_admin():
+        return RedirectResponse("/login")
+    return _read_web_file("setup.html")
+
+@app.post("/auth/setup")
+async def do_setup(payload: RegisterPayload):
+    if await db.has_any_admin():
+        raise HTTPException(400, "Setup already complete")
+    pw = auth.hash_password(payload.password)
+    ok = await db.create_user(payload.username, payload.email, pw, role="admin")
+    if not ok:
+        raise HTTPException(400, "Username or email already taken")
+    return {"ok": True}
+
+@app.post("/auth/register")
+async def register(payload: RegisterPayload, request: Request, background_tasks: BackgroundTasks):
+    pw = auth.hash_password(payload.password)
+    
+    # Root user semsem400 constraint
+    assigned_role = "pending_admin" if payload.role == "admin" else "user"
+    
+    ok = await db.create_user(payload.username, payload.email, pw, role=assigned_role, is_verified=0)
+    if not ok:
+        raise HTTPException(400, "Username or email already taken")
+        
+    otp = auth.generate_otp()
+    expires = auth.make_otp_expiry(minutes=10)
+    await db.create_auth_otp(payload.email, otp, "signup", expires)
+    
+    background_tasks.add_task(auth.send_auth_otp_email, payload.email, otp, "signup")
+    
+    return {"ok": True, "status": "verification_required", "email": payload.email}
+
+@app.post("/auth/verify-signup")
+async def verify_signup(payload: VerifySignupPayload):
+    valid = await db.validate_auth_otp(payload.email, payload.otp_code, "signup")
+    if not valid:
+        raise HTTPException(400, "Invalid or expired verification code")
+    
+    await db.mark_user_verified(payload.email)
+    return {"ok": True, "message": "Email verified successfully"}
+
+@app.post("/auth/login")
+async def login(payload: LoginPayload, request: Request, background_tasks: BackgroundTasks):
+    user = await db.get_user_by_username(payload.username)
+    if not user or not auth.verify_password(payload.password, user["password_hash"]):
+        raise HTTPException(401, "Invalid credentials")
+        
+    if user.get("is_verified", 1) == 0:
+        raise HTTPException(403, "Email not verified. Please verify your email first.")
+        
+    if user["role"] == "pending_admin":
+        raise HTTPException(403, "Your administrative account is pending approval from the root admin (semsem400).")
+        
+    otp = auth.generate_otp()
+    expires = auth.make_otp_expiry(minutes=10)
+    await db.create_auth_otp(user["email"], otp, "login", expires)
+    
+    background_tasks.add_task(auth.send_auth_otp_email, user["email"], otp, "login")
+    
+    return {"ok": True, "status": "otp_required", "email": user["email"]}
