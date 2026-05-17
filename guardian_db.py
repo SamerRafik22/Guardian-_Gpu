@@ -157,3 +157,77 @@ async def create_user(username, email, password_hash, role="user", machine_id=No
             return True
         except aiosqlite.IntegrityError:
             return False
+async def get_user_by_username(username):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM users WHERE username=? AND is_active=1", (username,)) as c:
+            row = await c.fetchone()
+            return dict(row) if row else None
+
+async def get_user_by_id(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM users WHERE id=? AND is_active=1", (user_id,)) as c:
+            row = await c.fetchone()
+            return dict(row) if row else None
+
+async def has_any_admin():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM users WHERE role='admin'") as c:
+            count = await c.fetchone()
+            return count[0] > 0
+
+async def mark_user_verified(email):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET is_verified=1 WHERE email=?", (email,))
+        await db.commit()
+
+async def delete_user(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM users WHERE id=?", (user_id,))
+        await db.commit()
+
+# ── Auth OTP CRUD ─────────────────────────────────────────────────────────────
+async def create_auth_otp(email, otp_code, purpose, expires_at):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO auth_otps (email, otp_code, purpose, expires_at) VALUES (?,?,?,?)",
+            (email, otp_code, purpose, expires_at)
+        )
+        await db.commit()
+
+async def validate_auth_otp(email, otp_code, purpose):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM auth_otps WHERE email=? AND otp_code=? AND purpose=? AND status='pending' AND expires_at > datetime('now')",
+            (email, otp_code, purpose)
+        ) as c:
+            row = await c.fetchone()
+            if not row:
+                return False
+        
+        await db.execute("UPDATE auth_otps SET status='used' WHERE id=?", (row['id'],))
+        await db.commit()
+        return True
+
+
+# ── Session CRUD ───────────────────────────────────────────────────────────────
+async def create_web_session(user_id, token, expires_at, ip=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO web_sessions (user_id, token, expires_at, created_from_ip) VALUES (?,?,?,?)",
+            (user_id, token, expires_at, ip)
+        )
+        await db.commit()
+
+async def get_session_by_token(token):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT s.*, u.username, u.role, u.email FROM web_sessions s "
+            "JOIN users u ON s.user_id = u.id "
+            "WHERE s.token=? AND s.expires_at > datetime('now')", (token,)
+        ) as c:
+            row = await c.fetchone()
+            return dict(row) if row else None
